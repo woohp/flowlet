@@ -98,28 +98,28 @@ async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concu
 
 @overload
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = True
+    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
 ) -> Operator[T, U]: ...
 
 
 @overload
-def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1, ordered: bool = True) -> Operator[T, U]: ...  # noqa: A001
+def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, U]: ...  # noqa: A001
 
 
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = True
+    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
 ) -> Operator[T, U]:
     async def expand(item: T) -> list[U]:
         return [await _maybe_await(fn(item))]
 
-    return flat_map(expand, concurrency=concurrency, ordered=ordered)
+    return flat_map(expand, concurrency=concurrency, preserve_order=preserve_order)
 
 
-def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, ordered: bool = True) -> Operator[T, U]:
+def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, U]:
     _validate_concurrency(concurrency)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
-        if ordered:
+        if preserve_order:
             async for value in _ordered_flat_map(source, fn, concurrency):
                 yield value
         else:
@@ -129,32 +129,32 @@ def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, ordered: bool = 
     return apply
 
 
-def filter[T](pred: Predicate[T], *, concurrency: int = 1, ordered: bool = True) -> Operator[T, T]:  # noqa: A001
+def filter[T](pred: Predicate[T], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, T]:  # noqa: A001
     async def expand(item: T) -> list[T]:
         return [item] if await _maybe_await(pred(item)) else []
 
-    return flat_map(expand, concurrency=concurrency, ordered=ordered)
+    return flat_map(expand, concurrency=concurrency, preserve_order=preserve_order)
 
 
 @overload
-def compose[T, U](op1: Operator[T, U], /) -> Operator[T, U]: ...
+def chain[T, U](op1: Operator[T, U], /) -> Operator[T, U]: ...
 
 
 @overload
-def compose[T, A, U](op1: Operator[T, A], op2: Operator[A, U], /) -> Operator[T, U]: ...
+def chain[T, A, U](op1: Operator[T, A], op2: Operator[A, U], /) -> Operator[T, U]: ...
 
 
 @overload
-def compose[T, A, B, U](op1: Operator[T, A], op2: Operator[A, B], op3: Operator[B, U], /) -> Operator[T, U]: ...
+def chain[T, A, B, U](op1: Operator[T, A], op2: Operator[A, B], op3: Operator[B, U], /) -> Operator[T, U]: ...
 
 
 @overload
-def compose[T, A, B, C, U](
+def chain[T, A, B, C, U](
     op1: Operator[T, A], op2: Operator[A, B], op3: Operator[B, C], op4: Operator[C, U], /
 ) -> Operator[T, U]: ...
 
 
-def compose(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
+def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
     def apply(source: Source[Any]) -> AsyncIterator[Any]:
         current: Source[Any] = source
         for operator in operators:
@@ -178,9 +178,9 @@ async def for_each[T](
     fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
     *,
     concurrency: int = 1,
-    ordered: bool = False,
+    preserve_order: bool = False,
 ) -> None:
-    await drain(map(fn, concurrency=concurrency, ordered=ordered)(source))
+    await drain(map(fn, concurrency=concurrency, preserve_order=preserve_order)(source))
 
 
 __all__ = [
@@ -188,8 +188,8 @@ __all__ = [
     "Operator",
     "Predicate",
     "Source",
+    "chain",
     "collect",
-    "compose",
     "drain",
     "filter",
     "flat_map",

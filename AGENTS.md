@@ -4,7 +4,7 @@
 
 - Trust `pyproject.toml`, `src/flowlet/__init__.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and `README.md`.
 - Python version is pinned to `3.13` in both `pyproject.toml` and `.python-version`.
-- This repo is a single-package library. The public API currently lives in `src/flowlet/` (`pipe`, `flowlet`, `Pipeline`, `Flowlet`, `Stage`, `op`, and `flowlet.functional`).
+- This repo is a single-package library. The public API currently lives in `src/flowlet/` (`pipe`, `chain`, `Pipeline`, `Flowlet`, `Stage`, `op`, and `flowlet.functional`).
 - Tests are all in `tests/test_pipeline.py`; there is no CI, pre-commit config, or other repo-local instruction file to consult.
 
 ## Commands
@@ -34,7 +34,8 @@
 
 - Keep edits small and centralized: most library changes only touch `src/flowlet/__init__.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and README examples.
 - The codebase already uses PEP 695 generics (`class Pipeline[T]`, `class Flowlet[T, U]`) and `from __future__ import annotations`; match that style when editing types.
-- The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is the operator alternative.
+- The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is mainly for reusable sourceless `Flowlet` fragments.
+- Use `preserve_order=False` for completion-order concurrent stages; the old `ordered` parameter should not be reintroduced.
 - `flowlet.functional` is the execution core; fluent `Pipeline`/`Flowlet` and `op` should wrap its curried operators rather than duplicating execution logic.
 - `None` is valid data. Do not reintroduce sentinel-value stream termination.
 - When changing pipeline behavior, verify focused async tests first, then run the full test suite.

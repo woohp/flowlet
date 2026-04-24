@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 import flowlet.functional as F
-from flowlet import Flowlet, Pipeline, flowlet, op, pipe
+from flowlet import Flowlet, Pipeline, chain, op, pipe
 
 
 async def double(x: int) -> int:
@@ -51,8 +51,8 @@ class TestPipelineApi:
         assert result == ["2", "4", "6"]
 
     @pytest.mark.asyncio
-    async def test_flowlet_constructor_sugar(self) -> None:
-        transform = flowlet(sync_double, sync_add_one, to_str)
+    async def test_chain_constructor_sugar(self) -> None:
+        transform = chain(sync_double, sync_add_one, to_str)
 
         result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
 
@@ -129,7 +129,7 @@ class TestConcurrency:
             await asyncio.sleep((3 - x) * 0.01)
             return x
 
-        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3, ordered=False).collect()
+        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3, preserve_order=False).collect()
 
         assert result == [3, 2, 1]
 
@@ -192,7 +192,7 @@ class TestErrors:
 class TestFunctionalApi:
     @pytest.mark.asyncio
     async def test_functional_api(self) -> None:
-        transform = F.compose(F.map(double), F.map(add_one), F.map(to_str))
+        transform = F.chain(F.map(double), F.map(add_one), F.map(to_str))
 
         result: list[str] = await F.collect(transform([1, 2, 3]))
 
@@ -205,10 +205,12 @@ def test_typing_surface() -> None:
     transform: Flowlet[int, str] = op.map(double) | op.map(to_str)
     filtered: Flowlet[int, int] = op.filter(lambda x: x > 1)
     expanded: Flowlet[int, int] = op.flat_map(lambda x: [x, x])
-    functional_transform: F.Operator[int, str] = F.compose(F.map(double), F.map(to_str))
+    chained: Flowlet[int, str] = chain(sync_double, sync_add_one, to_str)
+    functional_transform: F.Operator[int, str] = F.chain(F.map(double), F.map(to_str))
 
     assert isinstance(text, Pipeline)
     assert isinstance(transform, Flowlet)
     assert isinstance(filtered, Flowlet)
     assert isinstance(expanded, Flowlet)
+    assert isinstance(chained, Flowlet)
     assert functional_transform is not None
