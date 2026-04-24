@@ -44,7 +44,7 @@ class TestPipelineApi:
 
     @pytest.mark.asyncio
     async def test_reusable_flowlet(self) -> None:
-        transform: Flowlet[int, str] = Flowlet[int, int]().map(double).map(to_str)
+        transform: Flowlet[int, str] = Flowlet[int]().map(double).map(to_str)
 
         result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
 
@@ -202,6 +202,7 @@ class TestFunctionalApi:
 def test_typing_surface() -> None:
     numbers: Pipeline[int] = pipe([1, 2, 3])
     text: Pipeline[str] = numbers.map(to_str)
+    sourceless_chain = Flowlet[int]().map(double).map(to_str)
     transform: Flowlet[int, str] = op.map(double) | op.map(to_str)
     filtered: Flowlet[int, int] = op.filter(lambda x: x > 1)
     expanded: Flowlet[int, int] = op.flat_map(lambda x: [x, x])
@@ -209,6 +210,7 @@ def test_typing_surface() -> None:
     functional_transform: F.Operator[int, str] = F.chain(F.map(double), F.map(to_str))
 
     assert isinstance(text, Pipeline)
+    assert isinstance(sourceless_chain, Flowlet)
     assert isinstance(transform, Flowlet)
     assert isinstance(filtered, Flowlet)
     assert isinstance(expanded, Flowlet)

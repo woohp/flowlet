@@ -77,13 +77,13 @@ extract = (
 links = await (pipe(pages) | extract).collect()
 ```
 
-Use `Flowlet()` when you prefer the same method-chaining style as `Pipeline` or want an explicit annotation:
+Use `Flowlet[T]()` when you prefer the same method-chaining style as `Pipeline`. `Flowlet[T]()` starts a fragment whose input and current output type are both `T`.
 
 ```python
 from flowlet import Flowlet, pipe
 
 extract: Flowlet[Page, str] = (
-    Flowlet()
+    Flowlet[Page]()
     .flat_map(find_links)
     .filter(is_internal)
     .map(normalize_url)
@@ -91,6 +91,8 @@ extract: Flowlet[Page, str] = (
 
 links = await pipe(pages).then(extract).collect()
 ```
+
+Starting from bare `Flowlet()` is allowed, but type checkers cannot infer the fragment input type from no source. Prefer `Flowlet[T]()` for typed reusable fragments.
 
 For simple one-to-one chains, `chain(...)` is map-only sugar:
 

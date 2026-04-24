@@ -10,7 +10,7 @@ from flowlet.functional import Expander, Operator, Predicate, Source
 
 
 @dataclass(frozen=True)
-class Flowlet[T, U]:
+class Flowlet[T, U = T]:
     _operators: tuple[Operator[Any, Any], ...] = ()
 
     @overload

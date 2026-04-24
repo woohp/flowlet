@@ -35,6 +35,7 @@
 - Keep edits small and centralized: most library changes only touch `src/flowlet/__init__.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and README examples.
 - The codebase already uses PEP 695 generics (`class Pipeline[T]`, `class Flowlet[T, U]`) and `from __future__ import annotations`; match that style when editing types.
 - The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is mainly for reusable sourceless `Flowlet` fragments.
+- For typed sourceless method-chaining, start with `Flowlet[T]()`; bare `Flowlet()` produces `Flowlet[Any, ...]` because there is no source to infer the input type from.
 - Use `preserve_order=False` for completion-order concurrent stages; the old `ordered` parameter should not be reintroduced.
 - `flowlet.functional` is the execution core; fluent `Pipeline`/`Flowlet` and `op` should wrap its curried operators rather than duplicating execution logic.
 - `None` is valid data. Do not reintroduce sentinel-value stream termination.
