@@ -16,6 +16,27 @@ wheels = [
 ]
 
 [[package]]
+name = "flowlet"
+version = "0.1.0"
+source = { editable = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "mypy", specifier = ">=1.20.0" },
+    { name = "pytest", specifier = ">=9.0.2" },
+    { name = "pytest-asyncio", specifier = ">=1.3.0" },
+]
+
+[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -69,27 +90,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/bc/cd/de45b239ea3bdf626f982a00c14bfcf2e12d261c510ba7db62c5969a27cd/librt-0.9.0-cp314-cp314t-win32.whl", hash = "sha256:a9c63e04d003bc0fb6a03b348018b9a3002f98268200e22cc80f146beac5dc40", size = 52453, upload-time = "2026-04-09T16:06:05.229Z" },
     { url = "https://files.pythonhosted.org/packages/7f/f9/bfb32ae428aa75c0c533915622176f0a17d6da7b72b5a3c6363685914f70/librt-0.9.0-cp314-cp314t-win_amd64.whl", hash = "sha256:f162af66a2ed3f7d1d161a82ca584efd15acd9c1cff190a373458c32f7d42118", size = 60044, upload-time = "2026-04-09T16:06:06.398Z" },
     { url = "https://files.pythonhosted.org/packages/aa/47/7d70414bcdbb3bc1f458a8d10558f00bbfdb24e5a11740fc8197e12c3255/librt-0.9.0-cp314-cp314t-win_arm64.whl", hash = "sha256:a4b25c6c25cac5d0d9d6d6da855195b254e0021e513e0249f0e3b444dc6e0e61", size = 50009, upload-time = "2026-04-09T16:06:07.995Z" },
-]
-
-[[package]]
-name = "flowlet"
-version = "0.1.0"
-source = { editable = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.20.0" },
-    { name = "pytest", specifier = ">=9.0.2" },
-    { name = "pytest-asyncio", specifier = ">=1.3.0" },
 ]
 
 [[package]]

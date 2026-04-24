@@ -5,7 +5,8 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from flowlet import Flow, Pipeline, filter_, flat_map, flow, map_, pipe
+import flowlet.functional as F
+from flowlet import Flowlet, Pipeline, flowlet, op, pipe
 
 
 async def double(x: int) -> int:
@@ -37,21 +38,21 @@ class TestPipelineApi:
 
     @pytest.mark.asyncio
     async def test_operator_composition(self) -> None:
-        pipeline: Pipeline[int] = pipe([1, 2, 3]) | map_(double) | map_(add_one)
+        pipeline: Pipeline[int] = pipe([1, 2, 3]) | op.map(double) | op.map(add_one)
 
         assert await pipeline.collect() == [3, 5, 7]
 
     @pytest.mark.asyncio
-    async def test_reusable_flow(self) -> None:
-        transform: Flow[int, str] = Flow[int, int]().map(double).map(to_str)
+    async def test_reusable_flowlet(self) -> None:
+        transform: Flowlet[int, str] = Flowlet[int, int]().map(double).map(to_str)
 
         result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
 
         assert result == ["2", "4", "6"]
 
     @pytest.mark.asyncio
-    async def test_flow_constructor_sugar(self) -> None:
-        transform = flow(sync_double, sync_add_one, to_str)
+    async def test_flowlet_constructor_sugar(self) -> None:
+        transform = flowlet(sync_double, sync_add_one, to_str)
 
         result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
 
@@ -188,14 +189,26 @@ class TestErrors:
             await pipe([1, 2, 3]).map(boom, concurrency=2).collect()
 
 
+class TestFunctionalApi:
+    @pytest.mark.asyncio
+    async def test_functional_api(self) -> None:
+        transform = F.compose(F.map(double), F.map(add_one), F.map(to_str))
+
+        result: list[str] = await F.collect(transform([1, 2, 3]))
+
+        assert result == ["3", "5", "7"]
+
+
 def test_typing_surface() -> None:
     numbers: Pipeline[int] = pipe([1, 2, 3])
     text: Pipeline[str] = numbers.map(to_str)
-    transform: Flow[int, str] = map_(double) | map_(to_str)
-    filtered: Flow[int, int] = filter_(lambda x: x > 1)
-    expanded: Flow[int, int] = flat_map(lambda x: [x, x])
+    transform: Flowlet[int, str] = op.map(double) | op.map(to_str)
+    filtered: Flowlet[int, int] = op.filter(lambda x: x > 1)
+    expanded: Flowlet[int, int] = op.flat_map(lambda x: [x, x])
+    functional_transform: F.Operator[int, str] = F.compose(F.map(double), F.map(to_str))
 
     assert isinstance(text, Pipeline)
-    assert isinstance(transform, Flow)
-    assert isinstance(filtered, Flow)
-    assert isinstance(expanded, Flow)
+    assert isinstance(transform, Flowlet)
+    assert isinstance(filtered, Flowlet)
+    assert isinstance(expanded, Flowlet)
+    assert functional_transform is not None

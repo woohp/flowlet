@@ -2,11 +2,13 @@
 
 `flowlet` is a small async pipeline library for transforming streams with bounded parallelism.
 
+## Fluent API
+
 ```python
 from flowlet import pipe
 
 results = await (
-    pipe([1, 2, 3])
+    pipe(urls)
     .map(fetch, concurrency=20)
     .flat_map(extract_links)
     .filter(is_valid)
@@ -15,28 +17,26 @@ results = await (
 )
 ```
 
-## Core API
-
 - `pipe(source)` binds an iterable or async iterable source.
 - `.map(fn)` transforms one input into one output.
 - `.flat_map(fn)` transforms one input into zero or more outputs.
 - `.filter(pred)` keeps or drops each input.
-- `.then(flow)` appends a reusable flow.
+- `.then(flowlet)` appends a reusable flowlet.
 - `.collect()` consumes the pipeline into a list.
 - `.run()` drains the pipeline when outputs are intentionally ignored.
 - `.for_each(fn)` runs a terminal side effect for each item.
 
 Functions may be sync or async.
 
-## Reusable Flows
+## Reusable Flowlets
 
-Use `Flow` when you want to define a reusable pipeline fragment without binding a source.
+Use `Flowlet` to define a reusable pipeline fragment without binding a source.
 
 ```python
-from flowlet import Flow, pipe
+from flowlet import Flowlet, pipe
 
 extract = (
-    Flow[Page, Page]()
+    Flowlet[Page, Page]()
     .flat_map(find_links)
     .filter(is_internal)
     .map(normalize_url)
@@ -45,28 +45,52 @@ extract = (
 links = await pipe(pages).then(extract).collect()
 ```
 
-There is also constructor sugar for simple one-to-one chains:
+There is constructor sugar for simple one-to-one chains:
 
 ```python
-from flowlet import flow
+from flowlet import flowlet, pipe
 
-transform = flow(fetch, parse, normalize)
+transform = flowlet(fetch, parse, normalize)
 items = await pipe(urls).then(transform).collect()
 ```
 
 ## Operator Syntax
 
-`|` is available as an alternative composition syntax.
+`|` is available as an alternative fluent composition syntax through `flowlet.op`.
 
 ```python
-from flowlet import filter_, flat_map, map_, pipe
+from flowlet import op, pipe
 
 items = await (
     pipe(pages)
-    | flat_map(find_links)
-    | filter_(is_internal)
-    | map_(normalize_url)
+    | op.flat_map(find_links)
+    | op.filter(is_internal)
+    | op.map(normalize_url)
 ).collect()
+```
+
+## Functional API
+
+`flowlet.functional` exposes the curried stream operators that power the fluent API.
+
+```python
+import flowlet.functional as F
+
+pipeline = F.compose(
+    F.map(fetch, concurrency=20),
+    F.flat_map(extract_links),
+    F.filter(is_valid),
+    F.map(normalize),
+)
+
+items = await F.collect(pipeline(urls))
+```
+
+Each functional operator returns a reusable stream transformer:
+
+```python
+fetch_pages = F.map(fetch, concurrency=20)
+pages = fetch_pages(urls)
 ```
 
 ## Ordering
