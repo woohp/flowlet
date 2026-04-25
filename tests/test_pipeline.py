@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from typing import Any, cast
 
 import pytest
 
@@ -73,6 +74,39 @@ class TestCardinality:
         result: list[int] = await pipe([1, 2, 3]).flat_map(expand).collect()
 
         assert result == [1, 10, 3, 30]
+
+    @pytest.mark.asyncio
+    async def test_flat_map_streams_async_expansions(self) -> None:
+        never = asyncio.Event()
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            yield x
+            await never.wait()
+
+        stream = pipe([1]).flat_map(expand).__aiter__()
+
+        try:
+            assert await asyncio.wait_for(anext(stream), timeout=0.1) == 1
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_close_cancels_running_expansion(self) -> None:
+        cancelled = asyncio.Event()
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            try:
+                yield x
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        stream = pipe([1]).flat_map(expand).__aiter__()
+
+        assert await asyncio.wait_for(anext(stream), timeout=0.1) == 1
+        await cast(Any, stream).aclose()
+
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
 
     @pytest.mark.asyncio
     async def test_none_is_a_normal_value(self) -> None:
@@ -160,9 +194,21 @@ class TestSourcesAndTerminals:
             await asyncio.sleep((3 - x) * 0.01)
             output.append(x)
 
-        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
+        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3, preserve_order=False)
 
         assert sorted(output) == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_for_each_preserves_order_by_default(self) -> None:
+        output: list[int] = []
+
+        async def append_slowly(x: int) -> None:
+            await asyncio.sleep((3 - x) * 0.01)
+            output.append(x)
+
+        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
+
+        assert output == [1, 2, 3]
 
     @pytest.mark.asyncio
     async def test_drain_drains_pipeline(self) -> None:
@@ -193,6 +239,12 @@ class TestFunctionalApi:
         result: list[str] = await F.collect(transform([1, 2, 3]))
 
         assert result == ["3", "5", "7"]
+
+    @pytest.mark.asyncio
+    async def test_functional_chain_allows_identity(self) -> None:
+        identity: F.Operator[int, int] = F.chain()
+
+        assert await F.collect(identity([1, 2, 3])) == [1, 2, 3]
 
 
 def test_typing_surface() -> None:

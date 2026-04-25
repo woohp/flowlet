@@ -155,7 +155,7 @@ class Pipeline[T]:
         fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
         *,
         concurrency: int = 1,
-        preserve_order: bool = False,
+        preserve_order: bool = True,
     ) -> None:
         await functional.for_each(self, fn, concurrency=concurrency, preserve_order=preserve_order)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, Protocol, cast, overload
 
 type Source[T] = Iterable[T] | AsyncIterable[T]
@@ -35,64 +36,152 @@ async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
         yield item
 
 
-async def _collect_expansion[T, U](fn: Expander[T, U], item: T) -> list[U]:
-    expanded = await _maybe_await(fn(item))
-    output: list[U] = []
+@dataclass(frozen=True)
+class _Value[T]:
+    value: T
 
-    if isinstance(expanded, AsyncIterable):
-        async for value in expanded:
-            output.append(value)
-    else:
-        output.extend(cast(Iterable[U], expanded))
 
-    return output
+@dataclass(frozen=True)
+class _Error:
+    error: BaseException
+
+
+@dataclass(frozen=True)
+class _Done:
+    token: int
+
+
+type _QueueItem[T] = _Value[T] | _Error | _Done
+
+
+async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queue[_QueueItem[U]], token: int) -> None:
+    try:
+        expanded = await _maybe_await(fn(item))
+        if isinstance(expanded, AsyncIterable):
+            async for value in expanded:
+                await queue.put(_Value(value))
+        else:
+            for value in cast(Iterable[U], expanded):
+                await queue.put(_Value(value))
+    except BaseException as exc:
+        await queue.put(_Error(exc))
+    finally:
+        await queue.put(_Done(token))
+
+
+async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    task_list = list(tasks)
+    for task in task_list:
+        task.cancel()
+    if task_list:
+        await asyncio.gather(*task_list, return_exceptions=True)
+
+
+async def _close_async_iter(source: AsyncIterator[Any]) -> None:
+    aclose = getattr(source, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+async def _consume_ordered_expansion[U](
+    task: asyncio.Task[None], queue: asyncio.Queue[_QueueItem[U]]
+) -> AsyncIterator[U]:
+    while True:
+        match await queue.get():
+            case _Value(value):
+                yield value
+            case _Error(error):
+                raise error
+            case _Done():
+                await task
+                return
 
 
 async def _ordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
-    pending: list[asyncio.Task[list[U]]] = []
+    source_iter = to_async_iter(source)
+    pending: list[tuple[asyncio.Task[None], asyncio.Queue[_QueueItem[U]]]] = []
+    active_task: asyncio.Task[None] | None = None
+    source_done = False
+    next_token = 0
+
+    async def start_next() -> None:
+        nonlocal next_token, source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+        task = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
+        pending.append((task, queue))
+        next_token += 1
 
     try:
-        async for item in to_async_iter(source):
-            pending.append(asyncio.create_task(_collect_expansion(fn, item)))
+        while len(pending) < concurrency and not source_done:
+            await start_next()
 
-            if len(pending) >= concurrency:
-                done = pending.pop(0)
-                for value in await done:
-                    yield value
-
-        for task in pending:
-            for value in await task:
+        while pending:
+            task, queue = pending.pop(0)
+            active_task = task
+            async for value in _consume_ordered_expansion(task, queue):
                 yield value
+            active_task = None
+
+            while len(pending) < concurrency and not source_done:
+                await start_next()
     finally:
-        for task in pending:
-            if not task.done():
-                task.cancel()
+        tasks = [task for task, _ in pending]
+        if active_task is not None:
+            tasks.append(active_task)
+        await _cancel_tasks(tasks)
+        await _close_async_iter(source_iter)
 
 
 async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
-    pending: set[asyncio.Task[list[U]]] = set()
+    source_iter = to_async_iter(source)
+    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+    pending: dict[int, asyncio.Task[None]] = {}
+    source_done = False
+    next_token = 0
+
+    async def start_next() -> None:
+        nonlocal next_token, source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
+        next_token += 1
 
     try:
-        async for item in to_async_iter(source):
-            pending.add(asyncio.create_task(_collect_expansion(fn, item)))
-
-            while len(pending) >= concurrency:
-                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                pending.difference_update(done)
-                for task in done:
-                    for value in await task:
-                        yield value
+        while len(pending) < concurrency and not source_done:
+            await start_next()
 
         while pending:
-            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            pending.difference_update(done)
-            for task in done:
-                for value in await task:
+            match await queue.get():
+                case _Value(value):
                     yield value
+                case _Error(error):
+                    raise error
+                case _Done(token):
+                    task = pending.pop(token)
+                    await task
+                    while len(pending) < concurrency and not source_done:
+                        await start_next()
     finally:
-        for task in pending:
-            if not task.done():
-                task.cancel()
+        await _cancel_tasks(pending.values())
+        await _close_async_iter(source_iter)
 
 
 @overload
@@ -133,6 +222,10 @@ def filter[T](pred: Predicate[T], *, concurrency: int = 1, preserve_order: bool 
         return [item] if await _maybe_await(pred(item)) else []
 
     return flat_map(expand, concurrency=concurrency, preserve_order=preserve_order)
+
+
+@overload
+def chain[T]() -> Operator[T, T]: ...
 
 
 @overload
@@ -177,9 +270,15 @@ async def for_each[T](
     fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
     *,
     concurrency: int = 1,
-    preserve_order: bool = False,
+    preserve_order: bool = True,
 ) -> None:
-    await drain(map(fn, concurrency=concurrency, preserve_order=preserve_order)(source))
+    if preserve_order:
+        _validate_concurrency(concurrency)
+        async for item in to_async_iter(source):
+            await _maybe_await(fn(item))
+        return
+
+    await drain(map(fn, concurrency=concurrency, preserve_order=False)(source))
 
 
 __all__ = [

@@ -168,6 +168,12 @@ items = await pipe(urls).map(fetch, concurrency=20, preserve_order=False).collec
 
 With `preserve_order=True`, a slow earlier item can block later completed items from being yielded. With `preserve_order=False`, outputs are yielded as each task completes. Source items are pulled lazily, up to the stage concurrency and downstream demand.
 
+`.for_each(...)` defaults to ordered side effects, so it runs callbacks one at a time even if `concurrency` is provided. Use `preserve_order=False` for concurrent terminal side effects:
+
+```python
+await pipe(events).for_each(write_to_log, concurrency=20, preserve_order=False)
+```
+
 ## Cardinality
 
 Use the method that matches the stage cardinality.
@@ -178,7 +184,7 @@ pipe(items).filter(pred)  # one input -> zero or one output
 pipe(items).flat_map(fn)  # one input -> zero or more outputs
 ```
 
-`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
+`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
 
 `None` is treated as normal data. Filtering is explicit.
 
