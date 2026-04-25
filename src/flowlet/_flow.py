@@ -52,14 +52,14 @@ class Flow[T, U = T]:
     ) -> Flow[T, U]:
         return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
 
+    def apply(self, source: Source[T]) -> AsyncIterator[U]:
+        return functional.chain(*self._operators)(source)
+
     def through[V](self, flow: Flow[U, V]) -> Flow[T, V]:
         return Flow((*self._operators, *flow._operators))
 
     def __or__[V](self, flow: Flow[U, V]) -> Flow[T, V]:
         return self.through(flow)
-
-    def apply(self, source: Source[T]) -> AsyncIterator[U]:
-        return functional.chain(*self._operators)(source)
 
     @staticmethod
     def _from_operator[V, W](operator: Operator[V, W]) -> Flow[V, W]:
@@ -111,12 +111,6 @@ class Pipeline[T]:
     ) -> Pipeline[T]:
         return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
 
-    def through[U](self, flow: Flow[T, U]) -> Pipeline[U]:
-        return Pipeline(self._source, (*self._operators, *flow._operators))
-
-    def __or__[U](self, flow: Flow[T, U]) -> Pipeline[U]:
-        return self.through(flow)
-
     def __aiter__(self) -> AsyncIterator[T]:
         return functional.chain(*self._operators)(self._source)
 
@@ -133,6 +127,12 @@ class Pipeline[T]:
         concurrency: int = 1,
     ) -> None:
         await functional.for_each(self, fn, concurrency=concurrency)
+
+    def through[U](self, flow: Flow[T, U]) -> Pipeline[U]:
+        return Pipeline(self._source, (*self._operators, *flow._operators))
+
+    def __or__[U](self, flow: Flow[T, U]) -> Pipeline[U]:
+        return self.through(flow)
 
 
 def pipe[T](source: Source[T]) -> Pipeline[T]:

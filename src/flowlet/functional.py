@@ -15,27 +15,6 @@ class Operator[T, U](Protocol):
     def __call__(self, source: Source[T], /) -> AsyncIterator[U]: ...
 
 
-def _validate_concurrency(concurrency: int) -> None:
-    if concurrency < 1:
-        raise ValueError("concurrency must be >= 1")
-
-
-async def _maybe_await[T](value: T | Awaitable[T]) -> T:
-    if inspect.isawaitable(value):
-        return await value
-    return value
-
-
-async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
-    if isinstance(source, AsyncIterable):
-        async for item in source:
-            yield item
-        return
-
-    for item in source:
-        yield item
-
-
 @dataclass(frozen=True)
 class _Value[T]:
     value: T
@@ -54,121 +33,14 @@ class _Done:
 type _QueueItem[T] = _Value[T] | _Error | _Done
 
 
-async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queue[_QueueItem[U]], token: int) -> None:
-    try:
-        expanded = await _maybe_await(fn(item))
-        if isinstance(expanded, AsyncIterable):
-            async for value in expanded:
-                await queue.put(_Value(value))
-        else:
-            for value in cast(Iterable[U], expanded):
-                await queue.put(_Value(value))
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        queue.put_nowait(_Error(exc))
-    finally:
-        # _Done means the task terminated, not that it completed successfully.
-        # The flat_map queue is intentionally unbounded so termination can be
-        # signaled without awaiting during cancellation cleanup.
-        queue.put_nowait(_Done(token))
+async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
+    if isinstance(source, AsyncIterable):
+        async for item in source:
+            yield item
+        return
 
-
-async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
-    task_list = list(tasks)
-    for task in task_list:
-        task.cancel()
-    if task_list:
-        await asyncio.gather(*task_list, return_exceptions=True)
-
-
-async def _close_async_iter(source: AsyncIterator[Any]) -> None:
-    aclose = getattr(source, "aclose", None)
-    if aclose is not None:
-        await aclose()
-
-
-async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
-    source_iter = to_async_iter(source)
-    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
-    pending: dict[int, asyncio.Task[None]] = {}
-    source_done = False
-    next_token = 0
-
-    async def start_next() -> None:
-        nonlocal next_token, source_done
-
-        if source_done:
-            return
-
-        try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
-
-        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
-        next_token += 1
-
-    try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
-            match await queue.get():
-                case _Value(value):
-                    yield value
-                case _Error(error):
-                    raise error
-                case _Done(token):
-                    task = pending.pop(token)
-                    await task
-                    while len(pending) < concurrency and not source_done:
-                        await start_next()
-    finally:
-        await _cancel_tasks(pending.values())
-        await _close_async_iter(source_iter)
-
-
-async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
-    return await _maybe_await(fn(item))
-
-
-async def _map[T, U](
-    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
-) -> AsyncIterator[U]:
-    source_iter = to_async_iter(source)
-    pending: set[asyncio.Task[U]] = set()
-    source_done = False
-
-    async def start_next() -> None:
-        nonlocal source_done
-
-        if source_done:
-            return
-
-        try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
-
-        pending.add(asyncio.create_task(_apply_map(fn, item)))
-
-    try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                yield await task
-
-            while len(pending) < concurrency and not source_done:
-                await start_next()
-    finally:
-        await _cancel_tasks(pending)
-        await _close_async_iter(source_iter)
+    for item in source:
+        yield item
 
 
 @overload
@@ -232,6 +104,10 @@ def chain[T, A, B, C, U](
 ) -> Operator[T, U]: ...
 
 
+@overload
+def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]: ...
+
+
 def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
     def apply(source: Source[Any]) -> AsyncIterator[Any]:
         current: Source[Any] = source
@@ -258,6 +134,134 @@ async def for_each[T](
     concurrency: int = 1,
 ) -> None:
     await drain(map(fn, concurrency=concurrency)(source))
+
+
+def _validate_concurrency(concurrency: int) -> None:
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+
+
+async def _map[T, U](
+    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
+) -> AsyncIterator[U]:
+    source_iter = to_async_iter(source)
+    pending: set[asyncio.Task[U]] = set()
+    source_done = False
+
+    async def start_next() -> None:
+        nonlocal source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        pending.add(asyncio.create_task(_apply_map(fn, item)))
+
+    try:
+        while len(pending) < concurrency and not source_done:
+            await start_next()
+
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                yield await task
+
+            while len(pending) < concurrency and not source_done:
+                await start_next()
+    finally:
+        await _cancel_tasks(pending)
+        await _close_async_iter(source_iter)
+
+
+async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
+    return await _maybe_await(fn(item))
+
+
+async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
+    source_iter = to_async_iter(source)
+    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+    pending: dict[int, asyncio.Task[None]] = {}
+    source_done = False
+    next_token = 0
+
+    async def start_next() -> None:
+        nonlocal next_token, source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
+        next_token += 1
+
+    try:
+        while len(pending) < concurrency and not source_done:
+            await start_next()
+
+        while pending:
+            match await queue.get():
+                case _Value(value):
+                    yield value
+                case _Error(error):
+                    raise error
+                case _Done(token):
+                    task = pending.pop(token)
+                    await task
+                    while len(pending) < concurrency and not source_done:
+                        await start_next()
+    finally:
+        await _cancel_tasks(pending.values())
+        await _close_async_iter(source_iter)
+
+
+async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queue[_QueueItem[U]], token: int) -> None:
+    try:
+        expanded = await _maybe_await(fn(item))
+        if isinstance(expanded, AsyncIterable):
+            async for value in expanded:
+                await queue.put(_Value(value))
+        else:
+            for value in cast(Iterable[U], expanded):
+                await queue.put(_Value(value))
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        queue.put_nowait(_Error(exc))
+    finally:
+        # _Done means the task terminated, not that it completed successfully.
+        # The flat_map queue is intentionally unbounded so termination can be
+        # signaled without awaiting during cancellation cleanup.
+        queue.put_nowait(_Done(token))
+
+
+async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    task_list = list(tasks)
+    for task in task_list:
+        task.cancel()
+    if task_list:
+        await asyncio.gather(*task_list, return_exceptions=True)
+
+
+async def _close_async_iter(source: AsyncIterator[Any]) -> None:
+    aclose = getattr(source, "aclose", None)
+    if aclose is not None:
+        await aclose()
+
+
+async def _maybe_await[T](value: T | Awaitable[T]) -> T:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 __all__ = [
