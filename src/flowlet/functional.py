@@ -43,7 +43,7 @@ class _Value[T]:
 
 @dataclass(frozen=True)
 class _Error:
-    error: BaseException
+    error: Exception
 
 
 @dataclass(frozen=True)
@@ -63,10 +63,14 @@ async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queu
         else:
             for value in cast(Iterable[U], expanded):
                 await queue.put(_Value(value))
-    except BaseException as exc:
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
         await queue.put(_Error(exc))
     finally:
-        await queue.put(_Done(token))
+        task = asyncio.current_task()
+        if task is None or not task.cancelling():
+            await queue.put(_Done(token))
 
 
 async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
@@ -116,7 +120,7 @@ async def _ordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurr
             source_done = True
             return
 
-        queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+        queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue(maxsize=1)
         task = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
         pending.append((task, queue))
         next_token += 1
@@ -144,7 +148,7 @@ async def _ordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurr
 
 async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
     source_iter = to_async_iter(source)
-    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue(maxsize=concurrency)
     pending: dict[int, asyncio.Task[None]] = {}
     source_done = False
     next_token = 0
@@ -184,6 +188,89 @@ async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concu
         await _close_async_iter(source_iter)
 
 
+async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
+    return await _maybe_await(fn(item))
+
+
+async def _ordered_map[T, U](
+    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
+) -> AsyncIterator[U]:
+    source_iter = to_async_iter(source)
+    pending: list[asyncio.Task[U]] = []
+    active_task: asyncio.Task[U] | None = None
+    source_done = False
+
+    async def start_next() -> None:
+        nonlocal source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        pending.append(asyncio.create_task(_apply_map(fn, item)))
+
+    try:
+        while len(pending) < concurrency and not source_done:
+            await start_next()
+
+        while pending:
+            active_task = pending.pop(0)
+            yield await active_task
+            active_task = None
+
+            while len(pending) < concurrency and not source_done:
+                await start_next()
+    finally:
+        tasks = list(pending)
+        if active_task is not None:
+            tasks.append(active_task)
+        await _cancel_tasks(tasks)
+        await _close_async_iter(source_iter)
+
+
+async def _unordered_map[T, U](
+    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
+) -> AsyncIterator[U]:
+    source_iter = to_async_iter(source)
+    pending: set[asyncio.Task[U]] = set()
+    source_done = False
+
+    async def start_next() -> None:
+        nonlocal source_done
+
+        if source_done:
+            return
+
+        try:
+            item = await anext(source_iter)
+        except StopAsyncIteration:
+            source_done = True
+            return
+
+        pending.add(asyncio.create_task(_apply_map(fn, item)))
+
+    try:
+        while len(pending) < concurrency and not source_done:
+            await start_next()
+
+        while pending:
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            task = done.pop()
+            pending.remove(task)
+            yield await task
+
+            while len(pending) < concurrency and not source_done:
+                await start_next()
+    finally:
+        await _cancel_tasks(pending)
+        await _close_async_iter(source_iter)
+
+
 @overload
 def map[T, U](  # noqa: A001
     fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
@@ -197,10 +284,17 @@ def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1, preserve_order: boo
 def map[T, U](  # noqa: A001
     fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
 ) -> Operator[T, U]:
-    async def expand(item: T) -> list[U]:
-        return [await _maybe_await(fn(item))]
+    _validate_concurrency(concurrency)
 
-    return flat_map(expand, concurrency=concurrency, preserve_order=preserve_order)
+    async def apply(source: Source[T]) -> AsyncIterator[U]:
+        if preserve_order:
+            async for value in _ordered_map(source, fn, concurrency):
+                yield value
+        else:
+            async for value in _unordered_map(source, fn, concurrency):
+                yield value
+
+    return apply
 
 
 def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, U]:
@@ -272,13 +366,7 @@ async def for_each[T](
     concurrency: int = 1,
     preserve_order: bool = True,
 ) -> None:
-    if preserve_order:
-        _validate_concurrency(concurrency)
-        async for item in to_async_iter(source):
-            await _maybe_await(fn(item))
-        return
-
-    await drain(map(fn, concurrency=concurrency, preserve_order=False)(source))
+    await drain(map(fn, concurrency=concurrency, preserve_order=preserve_order)(source))
 
 
 __all__ = [

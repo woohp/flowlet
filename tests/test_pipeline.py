@@ -109,6 +109,39 @@ class TestCardinality:
         await asyncio.wait_for(cancelled.wait(), timeout=0.1)
 
     @pytest.mark.asyncio
+    async def test_ordered_flat_map_applies_backpressure_to_later_expansions(self) -> None:
+        release_first = asyncio.Event()
+        later_started = asyncio.Event()
+        produced: list[int] = []
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            if x == 1:
+                await release_first.wait()
+                yield x
+                return
+
+            later_started.set()
+            for value in range(10):
+                produced.append(value)
+                yield value
+
+        stream = pipe([1, 2]).flat_map(expand, concurrency=2).__aiter__()
+        first: asyncio.Future[int] = asyncio.ensure_future(anext(stream))
+
+        try:
+            await asyncio.wait_for(later_started.wait(), timeout=0.1)
+            await asyncio.sleep(0)
+
+            assert len(produced) <= 2
+
+            release_first.set()
+            assert await asyncio.wait_for(first, timeout=0.1) == 1
+        finally:
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
     async def test_none_is_a_normal_value(self) -> None:
         def maybe_value(x: int) -> list[int | None]:
             return [None] if x % 2 else [x]
@@ -199,14 +232,30 @@ class TestSourcesAndTerminals:
         assert sorted(output) == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_for_each_preserves_order_by_default(self) -> None:
+    async def test_for_each_uses_concurrency_by_default(self) -> None:
+        running = 0
+        max_running = 0
+
+        async def track_running(_: int) -> None:
+            nonlocal max_running, running
+            running += 1
+            max_running = max(max_running, running)
+            await asyncio.sleep(0.01)
+            running -= 1
+
+        await pipe([1, 2, 3]).for_each(track_running, concurrency=3)
+
+        assert max_running == 3
+
+    @pytest.mark.asyncio
+    async def test_for_each_requires_concurrency_one_for_ordered_side_effects(self) -> None:
         output: list[int] = []
 
         async def append_slowly(x: int) -> None:
             await asyncio.sleep((3 - x) * 0.01)
             output.append(x)
 
-        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
+        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=1)
 
         assert output == [1, 2, 3]
 
@@ -229,6 +278,14 @@ class TestErrors:
 
         with pytest.raises(RuntimeError, match="boom"):
             await pipe([1, 2, 3]).map(boom, concurrency=2).collect()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_propagates(self) -> None:
+        async def cancelled(_: int) -> list[int]:
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await pipe([1]).flat_map(cancelled).collect()
 
 
 class TestFunctionalApi:
