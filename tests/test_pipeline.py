@@ -152,6 +152,27 @@ class TestConcurrency:
         assert result == [3, 2, 1]
 
     @pytest.mark.asyncio
+    async def test_filter_emits_completion_order(self) -> None:
+        async def slow_keep(x: int) -> bool:
+            await asyncio.sleep((3 - x) * 0.01)
+            return True
+
+        result: list[int] = await pipe([1, 2, 3]).filter(slow_keep, concurrency=3).collect()
+
+        assert result == [3, 2, 1]
+
+    @pytest.mark.asyncio
+    async def test_flat_map_chatty_expansion_does_not_block_siblings(self) -> None:
+        async def expand(x: int) -> list[int]:
+            if x == 1:
+                return list(range(20))
+            return [x]
+
+        result = await asyncio.wait_for(pipe([1, 2, 3, 4]).flat_map(expand, concurrency=4).collect(), timeout=1)
+
+        assert sorted(result) == [0, 1, 2, 2, 3, 3, 4, *range(4, 20)]
+
+    @pytest.mark.asyncio
     async def test_invalid_concurrency_raises(self) -> None:
         with pytest.raises(ValueError, match="concurrency"):
             pipe([1]).map(double, concurrency=0)
@@ -245,6 +266,27 @@ class TestErrors:
 
         with pytest.raises(RuntimeError, match="boom"):
             await pipe([1, 2, 3]).map(boom, concurrency=2).collect()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_exception_propagates(self) -> None:
+        async def boom(x: int) -> list[int]:
+            if x == 2:
+                raise RuntimeError("boom")
+            return [x]
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await pipe([1, 2, 3]).flat_map(boom, concurrency=2).collect()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_base_exception_propagates(self) -> None:
+        class StopNow(BaseException):
+            pass
+
+        async def stop(_: int) -> list[int]:
+            raise StopNow
+
+        with pytest.raises(StopNow):
+            await pipe([1]).flat_map(stop).collect()
 
     @pytest.mark.asyncio
     async def test_cancelled_error_propagates(self) -> None:

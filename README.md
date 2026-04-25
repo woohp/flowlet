@@ -154,13 +154,20 @@ In a concurrent stage, if one in-flight item raises, the pipeline raises and pen
 
 Concurrency is configured per stage. A pipeline with two `concurrency=20` stages can have work in flight in both stages at the same time as downstream consumption allows.
 
-Concurrent stages emit values in completion order.
+Concurrent stages emit values in completion order. If you need input order, use `concurrency=1`.
 
 ```python
 items = await pipe(urls).map(fetch, concurrency=20).collect()
 ```
 
 With `concurrency > 1`, a faster later item can be yielded before a slower earlier item. Source items are pulled lazily, up to the stage concurrency and downstream demand.
+
+This applies to every concurrent stage, including filters:
+
+```python
+items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
+# May return [3, 1, 2], not necessarily [1, 2, 3].
+```
 
 `.for_each(...)` is implemented like `.map(fn, concurrency=...).drain()`, so terminal callbacks also run concurrently when `concurrency > 1`. If the callback mutates external state and that side effect must happen strictly in input order, use `concurrency=1`.
 
@@ -174,7 +181,7 @@ pipe(items).filter(pred)  # one input -> zero or one output
 pipe(items).flat_map(fn)  # one input -> zero or more outputs
 ```
 
-`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
+`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It expects each input to expand into a finite, reasonably small iterable or async iterable. Outputs are buffered internally; very large or infinite expansions may consume unbounded memory. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
 
 `None` is treated as normal data. Filtering is explicit.
 

@@ -66,11 +66,12 @@ async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queu
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        await queue.put(_Error(exc))
+        queue.put_nowait(_Error(exc))
     finally:
-        task = asyncio.current_task()
-        if task is None or not task.cancelling():
-            await queue.put(_Done(token))
+        # _Done means the task terminated, not that it completed successfully.
+        # The flat_map queue is intentionally unbounded so termination can be
+        # signaled without awaiting during cancellation cleanup.
+        queue.put_nowait(_Done(token))
 
 
 async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
@@ -89,7 +90,7 @@ async def _close_async_iter(source: AsyncIterator[Any]) -> None:
 
 async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
     source_iter = to_async_iter(source)
-    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue(maxsize=concurrency)
+    queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     pending: dict[int, asyncio.Task[None]] = {}
     source_done = False
     next_token = 0
@@ -159,10 +160,9 @@ async def _map[T, U](
             await start_next()
 
         while pending:
-            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            task = done.pop()
-            pending.remove(task)
-            yield await task
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                yield await task
 
             while len(pending) < concurrency and not source_done:
                 await start_next()
