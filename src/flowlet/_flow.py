@@ -59,10 +59,7 @@ class Flow[T, U = T]:
         return self.through(flow)
 
     def apply(self, source: Source[T]) -> AsyncIterator[U]:
-        current: Source[Any] = source
-        for operator in self._operators:
-            current = operator(current)
-        return functional.to_async_iter(current)
+        return functional.chain(*self._operators)(source)
 
     @staticmethod
     def _from_operator[V, W](operator: Operator[V, W]) -> Flow[V, W]:
@@ -121,10 +118,7 @@ class Pipeline[T]:
         return self.through(flow)
 
     def __aiter__(self) -> AsyncIterator[T]:
-        current: Source[Any] = self._source
-        for operator in self._operators:
-            current = operator(current)
-        return functional.to_async_iter(current)
+        return functional.chain(*self._operators)(self._source)
 
     async def collect(self) -> list[T]:
         return await functional.collect(self)
