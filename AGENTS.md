@@ -36,7 +36,7 @@
 - The codebase already uses PEP 695 generics (`class Pipeline[T]`, `class Flow[T, U]`) and `from __future__ import annotations`; match that style when editing types.
 - The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is mainly for reusable sourceless `Flow` fragments.
 - For typed sourceless method-chaining, start with `Flow[T]()`; bare `Flow()` produces `Flow[Any, ...]` because there is no source to infer the input type from.
-- Use `preserve_order=False` for completion-order concurrent stages; the old `ordered` parameter should not be reintroduced.
+- Concurrent stages emit values in completion order. Do not reintroduce ordered-output options unless explicitly requested.
 - `flowlet.functional` is the execution core; fluent `Pipeline`/`Flow` and `op` should wrap its curried operators rather than duplicating execution logic.
 - `None` is valid data. Do not reintroduce sentinel-value stream termination.
 - When changing pipeline behavior, verify focused async tests first, then run the full test suite.

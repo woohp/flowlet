@@ -150,31 +150,19 @@ The default error policy is fail-fast. Exceptions from sources or stages propaga
 
 In a concurrent stage, if one in-flight item raises, the pipeline raises and pending sibling tasks in that stage are cancelled. There is no skip-or-recover API yet; use explicit `try`/`except` inside your stage function if you want to convert failures into values or filter them with `.flat_map(...)`.
 
-## Concurrency And Ordering
+## Concurrency
 
 Concurrency is configured per stage. A pipeline with two `concurrency=20` stages can have work in flight in both stages at the same time as downstream consumption allows.
 
-Concurrent stages preserve input order by default.
+Concurrent stages emit values in completion order.
 
 ```python
 items = await pipe(urls).map(fetch, concurrency=20).collect()
 ```
 
-Use `preserve_order=False` when completion order is preferred.
+With `concurrency > 1`, a faster later item can be yielded before a slower earlier item. Source items are pulled lazily, up to the stage concurrency and downstream demand.
 
-```python
-items = await pipe(urls).map(fetch, concurrency=20, preserve_order=False).collect()
-```
-
-With `preserve_order=True`, a slow earlier item can block later completed items from being yielded. With `preserve_order=False`, outputs are yielded as each task completes. Source items are pulled lazily, up to the stage concurrency and downstream demand.
-
-`.for_each(...)` is implemented like `.map(fn, concurrency=...).drain()`. With `preserve_order=True`, callback results are observed in input order, but callbacks may still start concurrently. If the callback mutates external state and that side effect must happen strictly in input order, use `concurrency=1`.
-
-Use `preserve_order=False` when completion order is preferred for terminal side effects:
-
-```python
-await pipe(events).for_each(write_to_log, concurrency=20, preserve_order=False)
-```
+`.for_each(...)` is implemented like `.map(fn, concurrency=...).drain()`, so terminal callbacks also run concurrently when `concurrency > 1`. If the callback mutates external state and that side effect must happen strictly in input order, use `concurrency=1`.
 
 ## Cardinality
 
@@ -186,7 +174,7 @@ pipe(items).filter(pred)  # one input -> zero or one output
 pipe(items).flat_map(fn)  # one input -> zero or more outputs
 ```
 
-`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. Ordered concurrent `flat_map` applies backpressure to later expansions so they cannot buffer unbounded output behind a slow earlier item. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
+`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
 
 `None` is treated as normal data. Filtering is explicit.
 

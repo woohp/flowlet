@@ -87,66 +87,7 @@ async def _close_async_iter(source: AsyncIterator[Any]) -> None:
         await aclose()
 
 
-async def _consume_ordered_expansion[U](
-    task: asyncio.Task[None], queue: asyncio.Queue[_QueueItem[U]]
-) -> AsyncIterator[U]:
-    while True:
-        match await queue.get():
-            case _Value(value):
-                yield value
-            case _Error(error):
-                raise error
-            case _Done():
-                await task
-                return
-
-
-async def _ordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
-    source_iter = to_async_iter(source)
-    pending: list[tuple[asyncio.Task[None], asyncio.Queue[_QueueItem[U]]]] = []
-    active_task: asyncio.Task[None] | None = None
-    source_done = False
-    next_token = 0
-
-    async def start_next() -> None:
-        nonlocal next_token, source_done
-
-        if source_done:
-            return
-
-        try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
-
-        queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue(maxsize=1)
-        task = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
-        pending.append((task, queue))
-        next_token += 1
-
-    try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
-            task, queue = pending.pop(0)
-            active_task = task
-            async for value in _consume_ordered_expansion(task, queue):
-                yield value
-            active_task = None
-
-            while len(pending) < concurrency and not source_done:
-                await start_next()
-    finally:
-        tasks = [task for task, _ in pending]
-        if active_task is not None:
-            tasks.append(active_task)
-        await _cancel_tasks(tasks)
-        await _close_async_iter(source_iter)
-
-
-async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
+async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
     source_iter = to_async_iter(source)
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue(maxsize=concurrency)
     pending: dict[int, asyncio.Task[None]] = {}
@@ -192,48 +133,7 @@ async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], i
     return await _maybe_await(fn(item))
 
 
-async def _ordered_map[T, U](
-    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
-) -> AsyncIterator[U]:
-    source_iter = to_async_iter(source)
-    pending: list[asyncio.Task[U]] = []
-    active_task: asyncio.Task[U] | None = None
-    source_done = False
-
-    async def start_next() -> None:
-        nonlocal source_done
-
-        if source_done:
-            return
-
-        try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
-
-        pending.append(asyncio.create_task(_apply_map(fn, item)))
-
-    try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
-            active_task = pending.pop(0)
-            yield await active_task
-            active_task = None
-
-            while len(pending) < concurrency and not source_done:
-                await start_next()
-    finally:
-        tasks = list(pending)
-        if active_task is not None:
-            tasks.append(active_task)
-        await _cancel_tasks(tasks)
-        await _close_async_iter(source_iter)
-
-
-async def _unordered_map[T, U](
+async def _map[T, U](
     source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
 ) -> AsyncIterator[U]:
     source_iter = to_async_iter(source)
@@ -273,49 +173,41 @@ async def _unordered_map[T, U](
 
 @overload
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
+    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1
 ) -> Operator[T, U]: ...
 
 
 @overload
-def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, U]: ...  # noqa: A001
+def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1) -> Operator[T, U]: ...  # noqa: A001
 
 
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, preserve_order: bool = True
+    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1
 ) -> Operator[T, U]:
     _validate_concurrency(concurrency)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
-        if preserve_order:
-            async for value in _ordered_map(source, fn, concurrency):
-                yield value
-        else:
-            async for value in _unordered_map(source, fn, concurrency):
-                yield value
+        async for value in _map(source, fn, concurrency):
+            yield value
 
     return apply
 
 
-def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, U]:
+def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1) -> Operator[T, U]:
     _validate_concurrency(concurrency)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
-        if preserve_order:
-            async for value in _ordered_flat_map(source, fn, concurrency):
-                yield value
-        else:
-            async for value in _unordered_flat_map(source, fn, concurrency):
-                yield value
+        async for value in _flat_map(source, fn, concurrency):
+            yield value
 
     return apply
 
 
-def filter[T](pred: Predicate[T], *, concurrency: int = 1, preserve_order: bool = True) -> Operator[T, T]:  # noqa: A001
+def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Operator[T, T]:  # noqa: A001
     async def expand(item: T) -> list[T]:
         return [item] if await _maybe_await(pred(item)) else []
 
-    return flat_map(expand, concurrency=concurrency, preserve_order=preserve_order)
+    return flat_map(expand, concurrency=concurrency)
 
 
 @overload
@@ -364,9 +256,8 @@ async def for_each[T](
     fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
     *,
     concurrency: int = 1,
-    preserve_order: bool = True,
 ) -> None:
-    await drain(map(fn, concurrency=concurrency, preserve_order=preserve_order)(source))
+    await drain(map(fn, concurrency=concurrency)(source))
 
 
 __all__ = [

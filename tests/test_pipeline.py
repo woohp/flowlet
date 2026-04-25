@@ -109,39 +109,6 @@ class TestCardinality:
         await asyncio.wait_for(cancelled.wait(), timeout=0.1)
 
     @pytest.mark.asyncio
-    async def test_ordered_flat_map_applies_backpressure_to_later_expansions(self) -> None:
-        release_first = asyncio.Event()
-        later_started = asyncio.Event()
-        produced: list[int] = []
-
-        async def expand(x: int) -> AsyncIterator[int]:
-            if x == 1:
-                await release_first.wait()
-                yield x
-                return
-
-            later_started.set()
-            for value in range(10):
-                produced.append(value)
-                yield value
-
-        stream = pipe([1, 2]).flat_map(expand, concurrency=2).__aiter__()
-        first: asyncio.Future[int] = asyncio.ensure_future(anext(stream))
-
-        try:
-            await asyncio.wait_for(later_started.wait(), timeout=0.1)
-            await asyncio.sleep(0)
-
-            assert len(produced) <= 2
-
-            release_first.set()
-            assert await asyncio.wait_for(first, timeout=0.1) == 1
-        finally:
-            first.cancel()
-            await asyncio.gather(first, return_exceptions=True)
-            await cast(Any, stream).aclose()
-
-    @pytest.mark.asyncio
     async def test_none_is_a_normal_value(self) -> None:
         def maybe_value(x: int) -> list[int | None]:
             return [None] if x % 2 else [x]
@@ -162,25 +129,25 @@ class TestConcurrency:
     async def test_large_input_does_not_deadlock(self) -> None:
         result: list[int] = await asyncio.wait_for(pipe(range(100)).map(double, concurrency=10).collect(), timeout=1)
 
-        assert result == [x * 2 for x in range(100)]
+        assert sorted(result) == [x * 2 for x in range(100)]
 
     @pytest.mark.asyncio
-    async def test_ordered_by_default(self) -> None:
+    async def test_map_emits_completion_order(self) -> None:
         async def slow_inverse(x: int) -> int:
             await asyncio.sleep((3 - x) * 0.01)
             return x
 
         result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3).collect()
 
-        assert result == [1, 2, 3]
+        assert result == [3, 2, 1]
 
     @pytest.mark.asyncio
-    async def test_unordered_emits_completion_order(self) -> None:
-        async def slow_inverse(x: int) -> int:
+    async def test_flat_map_emits_completion_order(self) -> None:
+        async def expand(x: int) -> list[int]:
             await asyncio.sleep((3 - x) * 0.01)
-            return x
+            return [x]
 
-        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3, preserve_order=False).collect()
+        result: list[int] = await pipe([1, 2, 3]).flat_map(expand, concurrency=3).collect()
 
         assert result == [3, 2, 1]
 
@@ -227,7 +194,7 @@ class TestSourcesAndTerminals:
             await asyncio.sleep((3 - x) * 0.01)
             output.append(x)
 
-        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3, preserve_order=False)
+        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
 
         assert sorted(output) == [1, 2, 3]
 
@@ -248,7 +215,7 @@ class TestSourcesAndTerminals:
         assert max_running == 3
 
     @pytest.mark.asyncio
-    async def test_for_each_requires_concurrency_one_for_ordered_side_effects(self) -> None:
+    async def test_for_each_with_concurrency_one_runs_serially(self) -> None:
         output: list[int] = []
 
         async def append_slowly(x: int) -> None:
