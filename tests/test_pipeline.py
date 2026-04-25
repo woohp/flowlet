@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 import flowlet.functional as F
-from flowlet import Flowlet, Pipeline, chain, op, pipe
+from flowlet import Flow, Pipeline, op, pipe
 
 
 async def double(x: int) -> int:
@@ -19,14 +19,6 @@ async def add_one(x: int) -> int:
 
 def to_str(x: int) -> str:
     return str(x)
-
-
-def sync_double(x: int) -> int:
-    return x * 2
-
-
-def sync_add_one(x: int) -> int:
-    return x + 1
 
 
 class TestPipelineApi:
@@ -43,20 +35,12 @@ class TestPipelineApi:
         assert await pipeline.collect() == [3, 5, 7]
 
     @pytest.mark.asyncio
-    async def test_reusable_flowlet(self) -> None:
-        transform: Flowlet[int, str] = Flowlet[int]().map(double).map(to_str)
+    async def test_reusable_flow(self) -> None:
+        transform: Flow[int, str] = Flow[int]().map(double).map(to_str)
 
-        result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
+        result: list[str] = await pipe([1, 2, 3]).through(transform).collect()
 
         assert result == ["2", "4", "6"]
-
-    @pytest.mark.asyncio
-    async def test_chain_constructor_sugar(self) -> None:
-        transform = chain(sync_double, sync_add_one, to_str)
-
-        result: list[str] = await pipe([1, 2, 3]).then(transform).collect()
-
-        assert result == ["3", "5", "7"]
 
     @pytest.mark.asyncio
     async def test_pipeline_is_immutable(self) -> None:
@@ -169,10 +153,22 @@ class TestSourcesAndTerminals:
         assert sorted(output) == [1, 2, 3]
 
     @pytest.mark.asyncio
-    async def test_run_drains_pipeline(self) -> None:
+    async def test_for_each_supports_concurrency(self) -> None:
         output: list[int] = []
 
-        await pipe([1, 2, 3]).map(lambda x: output.append(x)).run()
+        async def append_slowly(x: int) -> None:
+            await asyncio.sleep((3 - x) * 0.01)
+            output.append(x)
+
+        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
+
+        assert sorted(output) == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_drain_drains_pipeline(self) -> None:
+        output: list[int] = []
+
+        await pipe([1, 2, 3]).map(lambda x: output.append(x)).drain()
 
         assert output == [1, 2, 3]
 
@@ -202,17 +198,15 @@ class TestFunctionalApi:
 def test_typing_surface() -> None:
     numbers: Pipeline[int] = pipe([1, 2, 3])
     text: Pipeline[str] = numbers.map(to_str)
-    sourceless_chain = Flowlet[int]().map(double).map(to_str)
-    transform: Flowlet[int, str] = op.map(double) | op.map(to_str)
-    filtered: Flowlet[int, int] = op.filter(lambda x: x > 1)
-    expanded: Flowlet[int, int] = op.flat_map(lambda x: [x, x])
-    chained: Flowlet[int, str] = chain(sync_double, sync_add_one, to_str)
+    sourceless_flow = Flow[int]().map(double).map(to_str)
+    transform: Flow[int, str] = op.map(double) | op.map(to_str)
+    filtered: Flow[int, int] = op.filter(lambda x: x > 1)
+    expanded: Flow[int, int] = op.flat_map(lambda x: [x, x])
     functional_transform: F.Operator[int, str] = F.chain(F.map(double), F.map(to_str))
 
     assert isinstance(text, Pipeline)
-    assert isinstance(sourceless_chain, Flowlet)
-    assert isinstance(transform, Flowlet)
-    assert isinstance(filtered, Flowlet)
-    assert isinstance(expanded, Flowlet)
-    assert isinstance(chained, Flowlet)
+    assert isinstance(sourceless_flow, Flow)
+    assert isinstance(transform, Flow)
+    assert isinstance(filtered, Flow)
+    assert isinstance(expanded, Flow)
     assert functional_transform is not None
