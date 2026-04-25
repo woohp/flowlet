@@ -2,7 +2,7 @@
 
 ## Repo Facts
 
-- Trust `pyproject.toml`, `src/flowlet/__init__.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and `README.md`.
+- Trust `pyproject.toml`, `src/flowlet/__init__.py`, `src/flowlet/_flow.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and `README.md`.
 - Python version is pinned to `3.13` in both `pyproject.toml` and `.python-version`.
 - This repo is a single-package library. The public API currently lives in `src/flowlet/` (`pipe`, `Pipeline`, `Flow`, `op`, and `flowlet.functional`).
 - Tests are all in `tests/test_pipeline.py`; there is no CI, pre-commit config, or other repo-local instruction file to consult.
@@ -32,7 +32,7 @@
 
 ## Working Notes
 
-- Keep edits small and centralized: most library changes only touch `src/flowlet/__init__.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and README examples.
+- Keep edits small and centralized: most library changes only touch `src/flowlet/__init__.py`, `src/flowlet/_flow.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and README examples.
 - The codebase already uses PEP 695 generics (`class Pipeline[T]`, `class Flow[T, U]`) and `from __future__ import annotations`; match that style when editing types.
 - The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is mainly for reusable sourceless `Flow` fragments.
 - For typed sourceless method-chaining, start with `Flow[T]()`; bare `Flow()` produces `Flow[Any, ...]` because there is no source to infer the input type from.

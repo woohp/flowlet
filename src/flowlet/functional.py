@@ -72,24 +72,23 @@ async def _ordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurr
 async def _unordered_flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
     pending: set[asyncio.Task[list[U]]] = set()
 
-    async def emit_finished() -> AsyncIterator[U]:
-        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        pending.difference_update(done)
-        for task in done:
-            for value in await task:
-                yield value
-
     try:
         async for item in to_async_iter(source):
             pending.add(asyncio.create_task(_collect_expansion(fn, item)))
 
             while len(pending) >= concurrency:
-                async for value in emit_finished():
-                    yield value
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                pending.difference_update(done)
+                for task in done:
+                    for value in await task:
+                        yield value
 
         while pending:
-            async for value in emit_finished():
-                yield value
+            done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            pending.difference_update(done)
+            for task in done:
+                for value in await task:
+                    yield value
     finally:
         for task in pending:
             if not task.done():

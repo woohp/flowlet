@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import overload
 
-from flowlet import Flow, functional
+import flowlet.functional as functional
+from flowlet._flow import Flow
 from flowlet.functional import Expander, Predicate
 
 
