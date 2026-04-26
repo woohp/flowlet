@@ -30,6 +30,37 @@ results = await (
 
 Functions may be sync or async.
 
+Use `in_thread(...)` for blocking synchronous work that should not run on the event loop:
+
+```python
+from flowlet import in_thread, pipe
+
+items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
+```
+
+`in_thread(fn, limit=16)` adds a wrapper-level throttle. `concurrency` still controls how many items the pipeline stage may have in flight. With `.map(in_thread(fn, limit=16), concurrency=64)`, up to 64 items may be active in the stage while at most 16 wrapped calls are submitted to the executor at once. That `limit` is enforced per wrapped callable per event loop, so the same wrapper can be reused safely across separate `asyncio.run(...)` calls.
+
+Cancellation stops waiting for a threaded call's result, but it does not interrupt synchronous code that is already running in a worker thread.
+
+If you pass both `executor=pool` and `limit=16`, both bounds apply: `limit` throttles this wrapper, while `pool.max_workers` remains the actual thread-pool-wide cap.
+
+If multiple stages should share one thread pool, pass the same executor to each wrapper:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from flowlet import in_thread, pipe
+
+with ThreadPoolExecutor(max_workers=16) as pool:
+    items = await (
+        pipe(keys)
+        .map(in_thread(load_s3, executor=pool, limit=8), concurrency=32)
+        .map(in_thread(parse_blob, executor=pool, limit=4), concurrency=32)
+        .collect()
+    )
+```
+
+Pass a `ThreadPoolExecutor` when using `executor=...`. `in_thread(...)` is for blocking thread-based work, not process pools.
+
 ## Reusable Flows
 
 `Flow` is the reusable sourceless pipeline fragment type. Use it when you want to name and reuse a transform.
@@ -182,6 +213,8 @@ pipe(items).flat_map(fn)  # one input -> zero or more outputs
 ```
 
 `flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It expects each input to expand into a finite, reasonably small iterable or async iterable. Outputs are buffered internally; very large or infinite expansions may consume unbounded memory. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
+
+With `flat_map(in_thread(fn))`, prefer returning a materialized collection such as `list` or `tuple`. If `fn` returns a lazy generator, the generator object is created in the worker thread but iterated later on the event-loop thread.
 
 `None` is treated as normal data. Filtering is explicit.
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import threading
+import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import pytest
 
 import flowlet.functional as F
-from flowlet import Flow, Pipeline, op, pipe
+from flowlet import Flow, Pipeline, in_thread, op, pipe
 
 
 async def double(x: int) -> int:
@@ -178,6 +182,248 @@ class TestConcurrency:
             pipe([1]).map(double, concurrency=0)
 
 
+class TestInThread:
+    @pytest.mark.asyncio
+    async def test_in_thread_supports_blocking_map(self) -> None:
+        result = await pipe([1, 2, 3]).map(in_thread(lambda x: x * 2), concurrency=3).collect()
+
+        assert sorted(result) == [2, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_in_thread_limit_bounds_parallelism(self) -> None:
+        running = 0
+        max_running = 0
+        lock = threading.Lock()
+
+        def block(x: int) -> int:
+            nonlocal max_running, running
+            with lock:
+                running += 1
+                max_running = max(max_running, running)
+            time.sleep(0.02)
+            with lock:
+                running -= 1
+            return x
+
+        result = await pipe(range(6)).map(in_thread(block, limit=2), concurrency=6).collect()
+
+        assert sorted(result) == list(range(6))
+        assert max_running == 2
+
+    @pytest.mark.asyncio
+    async def test_in_thread_supports_filter_and_flat_map(self) -> None:
+        filtered = await pipe([1, 2, 3, 4]).filter(in_thread(lambda x: x % 2 == 0), concurrency=1).collect()
+        expanded = await pipe([1, 2]).flat_map(in_thread(lambda x: [x, x * 10]), concurrency=1).collect()
+
+        assert filtered == [2, 4]
+        assert expanded == [1, 10, 2, 20]
+
+    @pytest.mark.asyncio
+    async def test_in_thread_supports_shared_executor(self) -> None:
+        thread_names: set[str] = set()
+        lock = threading.Lock()
+
+        def record_thread(x: int) -> int:
+            with lock:
+                thread_names.add(threading.current_thread().name)
+            time.sleep(0.01)
+            return x
+
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="flowlet-test") as pool:
+            result = await pipe([1, 2, 3]).map(in_thread(record_thread, executor=pool), concurrency=3).collect()
+
+        assert sorted(result) == [1, 2, 3]
+        assert thread_names
+        assert all(name.startswith("flowlet-test") for name in thread_names)
+
+    @pytest.mark.asyncio
+    async def test_in_thread_workers_feed_downstream_stage(self) -> None:
+        started = asyncio.Event()
+        release_workers = threading.Event()
+        running = 0
+        max_running = 0
+        seen_by_downstream: list[int] = []
+        lock = threading.Lock()
+        loop = asyncio.get_running_loop()
+
+        def block(x: int) -> int:
+            nonlocal max_running, running
+            with lock:
+                running += 1
+                max_running = max(max_running, running)
+                if running == 3:
+                    loop.call_soon_threadsafe(started.set)
+            release_workers.wait(timeout=1)
+            with lock:
+                running -= 1
+            return x
+
+        async def downstream(x: int) -> int:
+            seen_by_downstream.append(x)
+            await asyncio.sleep(0)
+            return x * 10
+
+        pipeline = pipe([1, 2, 3]).map(in_thread(block), concurrency=3).map(downstream, concurrency=1)
+        collect_task = asyncio.create_task(pipeline.collect())
+
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        assert seen_by_downstream == []
+
+        release_workers.set()
+
+        result = await asyncio.wait_for(collect_task, timeout=1)
+
+        assert sorted(result) == [10, 20, 30]
+        assert sorted(seen_by_downstream) == [1, 2, 3]
+        assert max_running == 3
+
+    @pytest.mark.asyncio
+    async def test_in_thread_scales_to_many_tasks(self) -> None:
+        running = 0
+        max_running = 0
+        seen_by_downstream = 0
+        lock = threading.Lock()
+
+        def block(x: int) -> int:
+            nonlocal max_running, running
+            with lock:
+                running += 1
+                max_running = max(max_running, running)
+            time.sleep(0.005)
+            with lock:
+                running -= 1
+            return x
+
+        async def downstream(x: int) -> int:
+            nonlocal seen_by_downstream
+            seen_by_downstream += 1
+            await asyncio.sleep(0)
+            return x
+
+        result = (
+            await pipe(range(200))
+            .map(in_thread(block, limit=8), concurrency=64)
+            .map(downstream, concurrency=4)
+            .collect()
+        )
+
+        assert sorted(result) == list(range(200))
+        assert seen_by_downstream == 200
+        assert max_running == 8
+
+    @pytest.mark.asyncio
+    async def test_in_thread_shared_executor_across_stages(self) -> None:
+        stage_one_running = 0
+        stage_two_running = 0
+        max_stage_one_running = 0
+        max_stage_two_running = 0
+        max_total_running = 0
+        lock = threading.Lock()
+
+        def stage_one(x: int) -> int:
+            nonlocal max_stage_one_running, max_total_running, stage_one_running, stage_two_running
+            with lock:
+                stage_one_running += 1
+                max_stage_one_running = max(max_stage_one_running, stage_one_running)
+                max_total_running = max(max_total_running, stage_one_running + stage_two_running)
+            time.sleep(0.01)
+            with lock:
+                stage_one_running -= 1
+            return x + 1
+
+        def stage_two(x: int) -> int:
+            nonlocal max_stage_two_running, max_total_running, stage_one_running, stage_two_running
+            with lock:
+                stage_two_running += 1
+                max_stage_two_running = max(max_stage_two_running, stage_two_running)
+                max_total_running = max(max_total_running, stage_one_running + stage_two_running)
+            time.sleep(0.01)
+            with lock:
+                stage_two_running -= 1
+            return x * 10
+
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="flowlet-shared") as pool:
+            result = (
+                await pipe(range(40))
+                .map(in_thread(stage_one, executor=pool, limit=3), concurrency=16)
+                .map(in_thread(stage_two, executor=pool, limit=2), concurrency=16)
+                .collect()
+            )
+
+        assert sorted(result) == [(x + 1) * 10 for x in range(40)]
+        assert max_stage_one_running == 3
+        assert max_stage_two_running == 2
+        assert 1 < max_total_running <= 4
+
+    def test_in_thread_rejects_async_callables(self) -> None:
+        async def async_fn(x: int) -> int:
+            return x
+
+        with pytest.raises(TypeError, match="async callables"):
+            in_thread(async_fn)
+
+    def test_in_thread_rejects_partial_of_async_callable(self) -> None:
+        async def async_fn(x: int, y: int) -> int:
+            return x + y
+
+        with pytest.raises(TypeError, match="async callables"):
+            in_thread(functools.partial(async_fn, 1))
+
+    def test_in_thread_rejects_async_generator_callables(self) -> None:
+        async def async_gen(x: int) -> AsyncIterator[int]:
+            yield x
+
+        with pytest.raises(TypeError, match="async callables"):
+            in_thread(async_gen)
+
+    def test_in_thread_rejects_invalid_limit(self) -> None:
+        with pytest.raises(ValueError, match="limit"):
+            in_thread(lambda x: x, limit=0)
+
+    def test_in_thread_preserves_function_metadata(self) -> None:
+        def named(x: int) -> int:
+            """docstring"""
+
+            return x
+
+        wrapped = in_thread(named)
+
+        assert wrapped.__name__ == "named"
+        assert wrapped.__doc__ == "docstring"
+
+    def test_in_thread_wrapper_can_be_reused_across_event_loops(self) -> None:
+        running = 0
+        max_running = 0
+        lock = threading.Lock()
+
+        def block(x: int) -> int:
+            nonlocal max_running, running
+            with lock:
+                running += 1
+                max_running = max(max_running, running)
+            time.sleep(0.01)
+            with lock:
+                running -= 1
+            return x
+
+        wrapped = in_thread(block, limit=2)
+
+        async def run_once() -> tuple[list[int], int]:
+            nonlocal max_running, running
+
+            result = await pipe(range(6)).map(wrapped, concurrency=6).collect()
+            return result, max_running
+
+        first_result, first_max = asyncio.run(run_once())
+        max_running = 0
+        second_result, second_max = asyncio.run(run_once())
+
+        assert sorted(first_result) == list(range(6))
+        assert sorted(second_result) == list(range(6))
+        assert first_max == 2
+        assert second_max == 2
+
+
 class TestSourcesAndTerminals:
     @pytest.mark.asyncio
     async def test_async_iterable_source(self) -> None:
@@ -316,6 +562,7 @@ class TestFunctionalApi:
 def test_typing_surface() -> None:
     numbers: Pipeline[int] = pipe([1, 2, 3])
     text: Pipeline[str] = numbers.map(to_str)
+    threaded = in_thread(to_str)
     sourceless_flow = Flow[int]().map(double).map(to_str)
     transform: Flow[int, str] = op.map(double) | op.map(to_str)
     filtered: Flow[int, int] = op.filter(lambda x: x > 1)
@@ -323,6 +570,7 @@ def test_typing_surface() -> None:
     functional_transform: F.Operator[int, str] = F.chain(F.map(double), F.map(to_str))
 
     assert isinstance(text, Pipeline)
+    assert callable(threaded)
     assert isinstance(sourceless_flow, Flow)
     assert isinstance(transform, Flow)
     assert isinstance(filtered, Flow)
