@@ -177,6 +177,31 @@ class TestConcurrency:
         assert sorted(result) == [0, 1, 2, 2, 3, 3, 4, *range(4, 20)]
 
     @pytest.mark.asyncio
+    async def test_flat_map_supports_concurrent_async_generator_expansions(self) -> None:
+        async def expand(x: int) -> AsyncIterator[int]:
+            await asyncio.sleep((3 - x) * 0.01)
+            yield x
+            yield x * 10
+
+        result = await pipe([1, 2, 3]).flat_map(expand, concurrency=3).collect()
+
+        assert result == [3, 30, 2, 20, 1, 10]
+
+    @pytest.mark.asyncio
+    async def test_chained_concurrent_stages_complete(self) -> None:
+        async def first(x: int) -> int:
+            await asyncio.sleep((3 - x) * 0.01)
+            return x + 1
+
+        async def second(x: int) -> int:
+            await asyncio.sleep(0)
+            return x * 10
+
+        result = await pipe([1, 2, 3]).map(first, concurrency=3).map(second, concurrency=2).collect()
+
+        assert sorted(result) == [20, 30, 40]
+
+    @pytest.mark.asyncio
     async def test_invalid_concurrency_raises(self) -> None:
         with pytest.raises(ValueError, match="concurrency"):
             pipe([1]).map(double, concurrency=0)
@@ -446,6 +471,25 @@ class TestSourcesAndTerminals:
         assert output == [2, 4, 6]
 
     @pytest.mark.asyncio
+    async def test_break_from_concurrent_pipeline_cancels_pending_work(self) -> None:
+        cancelled = asyncio.Event()
+
+        async def work(x: int) -> int:
+            if x == 1:
+                return x
+
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+            return x
+
+        async for _ in pipe([1, 2, 3]).map(work, concurrency=3):
+            break
+
+        await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+
+    @pytest.mark.asyncio
     async def test_for_each_runs_side_effects(self) -> None:
         output: list[int] = []
 
@@ -494,6 +538,15 @@ class TestSourcesAndTerminals:
         assert output == [1, 2, 3]
 
     @pytest.mark.asyncio
+    async def test_for_each_propagates_errors(self) -> None:
+        async def boom(x: int) -> None:
+            if x == 2:
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await pipe([1, 2, 3]).for_each(boom, concurrency=2)
+
+    @pytest.mark.asyncio
     async def test_drain_drains_pipeline(self) -> None:
         output: list[int] = []
 
@@ -503,6 +556,15 @@ class TestSourcesAndTerminals:
 
 
 class TestErrors:
+    @pytest.mark.asyncio
+    async def test_source_exception_propagates(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            raise RuntimeError("source boom")
+
+        with pytest.raises(RuntimeError, match="source boom"):
+            await pipe(source()).map(double).collect()
+
     @pytest.mark.asyncio
     async def test_worker_exception_propagates(self) -> None:
         async def boom(x: int) -> int:
@@ -529,6 +591,18 @@ class TestErrors:
             pass
 
         async def stop(_: int) -> list[int]:
+            raise StopNow
+
+        with pytest.raises(StopNow):
+            await pipe([1]).flat_map(stop).collect()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_base_exception_during_async_iteration_propagates(self) -> None:
+        class StopNow(BaseException):
+            pass
+
+        async def stop(_: int) -> AsyncIterator[int]:
+            yield 1
             raise StopNow
 
         with pytest.raises(StopNow):

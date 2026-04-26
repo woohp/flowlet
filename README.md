@@ -2,6 +2,22 @@
 
 `flowlet` is a small async pipeline library for transforming streams with bounded stage-level parallelism.
 
+## Requirements
+
+`flowlet` requires Python 3.13 or newer.
+
+## Installation
+
+```bash
+uv add flowlet
+```
+
+or:
+
+```bash
+pip install flowlet
+```
+
 ## Pipeline API
 
 The pipeline API is the default interface. It is method chaining over a lazy async stream; nothing runs until the pipeline is consumed with `async for` or a terminal method such as `.collect()`, `.for_each()`, or `.drain()`.

@@ -110,10 +110,13 @@ def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]: ...
 
 def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
     def apply(source: Source[Any]) -> AsyncIterator[Any]:
+        if not operators:
+            return to_async_iter(source)
+
         current: Source[Any] = source
         for operator in operators:
             current = operator(current)
-        return to_async_iter(current)
+        return cast(AsyncIterator[Any], current)
 
     return apply
 
@@ -144,8 +147,14 @@ def _validate_concurrency(concurrency: int) -> None:
 async def _map[T, U](
     source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
 ) -> AsyncIterator[U]:
+    if concurrency == 1:
+        async for item in to_async_iter(source):
+            yield await _apply_map(fn, item)
+        return
+
     source_iter = to_async_iter(source)
     pending: set[asyncio.Task[U]] = set()
+    remaining_done: set[asyncio.Task[U]] = set()
     source_done = False
 
     async def start_next() -> None:
@@ -168,11 +177,16 @@ async def _map[T, U](
 
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            remaining_done = set(done)
             for task in done:
+                remaining_done.remove(task)
                 yield await task
 
             while len(pending) < concurrency and not source_done:
                 await start_next()
+    except BaseException:
+        await asyncio.gather(*remaining_done, return_exceptions=True)
+        raise
     finally:
         await _cancel_tasks(pending)
         await _close_async_iter(source_iter)
