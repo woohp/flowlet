@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import multiprocessing as mp
 import threading
 import time
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, cast
 
 import pytest
 
 import flowlet.functional as F
-from flowlet import Flow, Pipeline, in_thread, op, pipe
+from flowlet import Flow, Pipeline, in_process, in_thread, op, pipe
 
 
 async def double(x: int) -> int:
@@ -24,6 +25,28 @@ async def add_one(x: int) -> int:
 
 def to_str(x: int) -> str:
     return str(x)
+
+
+def process_double(x: int) -> int:
+    return x * 2
+
+
+def process_is_even(x: int) -> bool:
+    return x % 2 == 0
+
+
+def process_expand(x: int) -> list[int]:
+    return [x, x * 10]
+
+
+def process_sleep_and_track(x: int, running: Any, max_running: Any, lock: Any) -> int:
+    with lock:
+        running.value += 1
+        max_running.value = max(max_running.value, running.value)
+    time.sleep(0.05)
+    with lock:
+        running.value -= 1
+    return x
 
 
 class TestPipelineApi:
@@ -447,6 +470,88 @@ class TestInThread:
         assert sorted(second_result) == list(range(6))
         assert first_max == 2
         assert second_max == 2
+
+
+class TestInProcess:
+    @pytest.mark.asyncio
+    async def test_in_process_supports_blocking_map(self) -> None:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
+            result = await pipe([1, 2, 3]).map(in_process(process_double, executor=pool), concurrency=3).collect()
+
+        assert sorted(result) == [2, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_in_process_limit_bounds_parallelism(self) -> None:
+        ctx = mp.get_context("fork")
+        with mp.Manager() as manager:
+            running = manager.Value("i", 0)
+            max_running = manager.Value("i", 0)
+            lock = manager.Lock()
+            task = functools.partial(process_sleep_and_track, running=running, max_running=max_running, lock=lock)
+
+            with ProcessPoolExecutor(max_workers=4, mp_context=ctx) as pool:
+                result = await pipe(range(6)).map(in_process(task, executor=pool, limit=2), concurrency=6).collect()
+
+            assert sorted(result) == list(range(6))
+            assert max_running.value == 2
+
+    @pytest.mark.asyncio
+    async def test_in_process_supports_filter_and_flat_map(self) -> None:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
+            filtered = (
+                await pipe([1, 2, 3, 4]).filter(in_process(process_is_even, executor=pool), concurrency=2).collect()
+            )
+            expanded = await pipe([1, 2]).flat_map(in_process(process_expand, executor=pool), concurrency=2).collect()
+
+        assert sorted(filtered) == [2, 4]
+        assert sorted(expanded) == [1, 2, 10, 20]
+
+    def test_in_process_rejects_async_callables(self) -> None:
+        async def async_fn(x: int) -> int:
+            return x
+
+        ctx = mp.get_context("fork")
+        with (
+            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
+            pytest.raises(TypeError, match="async callables"),
+        ):
+            in_process(async_fn, executor=pool)
+
+    def test_in_process_rejects_partial_of_async_callable(self) -> None:
+        async def async_fn(x: int, y: int) -> int:
+            return x + y
+
+        ctx = mp.get_context("fork")
+        with (
+            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
+            pytest.raises(TypeError, match="async callables"),
+        ):
+            in_process(functools.partial(async_fn, 1), executor=pool)
+
+    def test_in_process_rejects_async_generator_callables(self) -> None:
+        async def async_gen(x: int) -> AsyncIterator[int]:
+            yield x
+
+        ctx = mp.get_context("fork")
+        with (
+            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
+            pytest.raises(TypeError, match="async callables"),
+        ):
+            in_process(async_gen, executor=pool)
+
+    def test_in_process_rejects_invalid_limit(self) -> None:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool, pytest.raises(ValueError, match="limit"):
+            in_process(process_double, executor=pool, limit=0)
+
+    def test_in_process_preserves_function_metadata(self) -> None:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+            wrapped = in_process(to_str, executor=pool)
+
+        assert wrapped.__name__ == "to_str"
 
 
 class TestSourcesAndTerminals:

@@ -77,6 +77,22 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 Pass a `ThreadPoolExecutor` when using `executor=...`. `in_thread(...)` is for blocking thread-based work, not process pools.
 
+Use `in_process(...)` for CPU-bound synchronous work that should run in a process pool:
+
+```python
+from concurrent.futures import ProcessPoolExecutor
+from flowlet import in_process, pipe
+
+with ProcessPoolExecutor(max_workers=8) as pool:
+    items = await pipe(keys).map(in_process(crunch, executor=pool), concurrency=8).collect()
+```
+
+Unlike `in_thread(...)`, `in_process(...)` has no default executor. `in_thread(...)` can use asyncio's default thread pool, but process pools must be explicitly started and shut down, so `in_process(fn, executor=pool, limit=...)` always requires a `ProcessPoolExecutor`. For the usual case, set `concurrency` to the process pool size and omit `limit`; use `limit` only when this wrapper should submit fewer calls than the stage or executor would otherwise allow.
+
+The wrapped function, its arguments, and its return values must be pickleable for cross-platform process-pool code. The default start method varies by platform and Python version: `fork` on Linux before Python 3.14 (where local functions and lambdas work), `forkserver` on Linux from Python 3.14 onwards, and `spawn` on macOS and Windows — both `forkserver` and `spawn` require importable module-level functions. Use module-level functions for portable in_process(...) pipelines.
+
+`in_process(...)` does not propagate `contextvars` into workers. `in_thread(...)` can copy context into another thread in the same process, but `contextvars.Context` is not pickleable and cannot be sent to worker processes. Cancellation stops waiting for the process-pool result, but a task that is already running in a `ProcessPoolExecutor` cannot be cancelled individually; use `concurrency`, `limit`, or the executor's worker count as the practical throttles.
+
 ## Reusable Flows
 
 `Flow` is the reusable sourceless pipeline fragment type. Use it when you want to name and reuse a transform.
