@@ -722,6 +722,95 @@ class TestErrors:
             await pipe([1]).flat_map(cancelled).collect()
 
 
+class TestBatch:
+    @pytest.mark.asyncio
+    async def test_batch_exact_division(self) -> None:
+        result = await pipe([1, 2, 3, 4, 5, 6]).batch(3).collect()
+
+        assert result == [[1, 2, 3], [4, 5, 6]]
+
+    @pytest.mark.asyncio
+    async def test_batch_partial_last_group(self) -> None:
+        result = await pipe([1, 2, 3, 4, 5]).batch(3).collect()
+
+        assert result == [[1, 2, 3], [4, 5]]
+
+    @pytest.mark.asyncio
+    async def test_batch_single_item(self) -> None:
+        result = await pipe([1]).batch(5).collect()
+
+        assert result == [[1]]
+
+    @pytest.mark.asyncio
+    async def test_batch_empty_source(self) -> None:
+        source: list[int] = []
+        result = await pipe(source).batch(3).collect()
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_batch_size_one(self) -> None:
+        result = await pipe([1, 2, 3]).batch(1).collect()
+
+        assert result == [[1], [2], [3]]
+
+    def test_batch_invalid_size_raises(self) -> None:
+        with pytest.raises(ValueError, match="size"):
+            pipe([1]).batch(0)
+
+    @pytest.mark.asyncio
+    async def test_batch_with_async_source(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            for i in range(5):
+                yield i
+
+        result = await pipe(source()).batch(2).collect()
+
+        assert result == [[0, 1], [2, 3], [4]]
+
+    @pytest.mark.asyncio
+    async def test_batch_feeds_downstream_map(self) -> None:
+        result = await pipe([1, 2, 3, 4]).batch(2).map(sum).collect()
+
+        assert result == [3, 7]
+
+    @pytest.mark.asyncio
+    async def test_batch_after_concurrent_stage(self) -> None:
+        result: list[list[int]] = await pipe(range(6)).map(double, concurrency=3).batch(2).collect()
+
+        all_values = sorted(v for batch in result for v in batch)
+        assert all_values == [0, 2, 4, 6, 8, 10]
+        assert all(len(b) == 2 for b in result)
+
+    @pytest.mark.asyncio
+    async def test_batch_with_op(self) -> None:
+        result = await (pipe([1, 2, 3, 4]) | op.batch(3)).collect()
+
+        assert result == [[1, 2, 3], [4]]
+
+    @pytest.mark.asyncio
+    async def test_batch_with_flow(self) -> None:
+        chunk_and_sum: Flow[int, int] = Flow[int]().batch(2).map(sum)
+
+        result = await pipe([1, 2, 3, 4, 5]).through(chunk_and_sum).collect()
+
+        assert result == [3, 7, 5]
+
+    @pytest.mark.asyncio
+    async def test_batch_with_functional_api(self) -> None:
+        transform: F.Operator[int, int] = F.chain(F.batch(3), F.map(len))
+
+        result = await F.collect(transform([1, 2, 3, 4, 5]))
+
+        assert result == [3, 2]
+
+    @pytest.mark.asyncio
+    async def test_batch_preserves_none_values(self) -> None:
+        result = await pipe([None, 1, None, 2]).batch(2).collect()
+
+        assert result == [[None, 1], [None, 2]]
+
+
 class TestFunctionalApi:
     @pytest.mark.asyncio
     async def test_functional_api(self) -> None:
@@ -747,6 +836,10 @@ def test_typing_surface() -> None:
     filtered: Flow[int, int] = op.filter(lambda x: x > 1)
     expanded: Flow[int, int] = op.flat_map(lambda x: [x, x])
     functional_transform: F.Operator[int, str] = F.chain(F.map(double), F.map(to_str))
+    batched_pipeline: Pipeline[list[int]] = numbers.batch(2)
+    batched_flow: Flow[int, list[int]] = Flow[int]().batch(2)
+    batched_op: Flow[int, list[int]] = op.batch(2)
+    batched_functional: F.Operator[int, list[int]] = F.batch(2)
 
     assert isinstance(text, Pipeline)
     assert callable(threaded)
@@ -755,3 +848,7 @@ def test_typing_surface() -> None:
     assert isinstance(filtered, Flow)
     assert isinstance(expanded, Flow)
     assert functional_transform is not None
+    assert isinstance(batched_pipeline, Pipeline)
+    assert isinstance(batched_flow, Flow)
+    assert isinstance(batched_op, Flow)
+    assert batched_functional is not None

@@ -35,4 +35,9 @@ def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Flow[T, T]:  # noq
     return Flow._from_operator(functional.filter(pred, concurrency=concurrency))
 
 
-__all__ = ["filter", "flat_map", "map"]
+def batch[T](size: int) -> Flow[T, list[T]]:
+    """Build a reusable one-step flow that collects items into lists of up to `size`."""
+    return Flow._from_operator(functional.batch(size))
+
+
+__all__ = ["batch", "filter", "flat_map", "map"]

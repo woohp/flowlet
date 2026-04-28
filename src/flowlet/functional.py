@@ -101,6 +101,28 @@ def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Operator[T, T]:  #
     return flat_map(expand, concurrency=concurrency)
 
 
+def batch[T](size: int) -> Operator[T, list[T]]:
+    """Return an operator that collects items into lists of up to `size`.
+
+    The last emitted list may contain fewer than `size` items when the source
+    is exhausted with a partial group.
+    """
+    if size < 1:
+        raise ValueError("size must be >= 1")
+
+    async def apply(source: Source[T]) -> AsyncIterator[list[T]]:
+        chunk: list[T] = []
+        async for item in to_async_iter(source):
+            chunk.append(item)
+            if len(chunk) == size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
+    return apply
+
+
 @overload
 def chain[T]() -> Operator[T, T]: ...
 
@@ -341,6 +363,7 @@ __all__ = [
     "Operator",
     "Predicate",
     "Source",
+    "batch",
     "chain",
     "collect",
     "drain",

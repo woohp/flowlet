@@ -39,6 +39,7 @@ results = await (
 - `.map(fn)` transforms one input into one output.
 - `.flat_map(fn)` transforms one input into zero or more outputs.
 - `.filter(pred)` keeps or drops each input.
+- `.batch(size)` collects items into lists of up to `size`.
 - `.through(flow)` appends a reusable `Flow` fragment.
 - `.collect()` consumes the pipeline into a list.
 - `.for_each(fn, concurrency=...)` runs a terminal side effect for each item.
@@ -242,11 +243,18 @@ Use the method that matches the stage cardinality.
 pipe(items).map(fn)       # one input -> one output
 pipe(items).filter(pred)  # one input -> zero or one output
 pipe(items).flat_map(fn)  # one input -> zero or more outputs
+pipe(items).batch(size)   # many inputs -> one output (list)
 ```
 
 `flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It expects each input to expand into a finite, reasonably small iterable or async iterable. Outputs are buffered internally; very large or infinite expansions may consume unbounded memory. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
 
 With `flat_map(in_thread(fn))`, prefer returning a materialized collection such as `list` or `tuple`. If `fn` returns a lazy generator, the generator object is created in the worker thread but iterated later on the event-loop thread.
+
+`batch(size)` collects items into lists of up to `size`. The last emitted list may be shorter when the source is exhausted with a partial group. This is useful for batching API calls, database inserts, or any operation that benefits from processing items in chunks:
+
+```python
+await pipe(records).batch(100).map(bulk_insert).drain()
+```
 
 `None` is treated as normal data. Filtering is explicit.
 

@@ -73,6 +73,10 @@ class Flow[T, U = T]:
         """
         return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
 
+    def batch(self, size: int) -> Flow[T, list[U]]:
+        """Return a flow that collects items into lists of up to `size`."""
+        return self | Flow._from_operator(functional.batch(size))
+
     def apply(self, source: Source[T]) -> AsyncIterator[U]:
         """Apply this flow to a source and return an async iterator."""
         return functional.chain(*self._operators)(source)
@@ -155,6 +159,10 @@ class Pipeline[T]:
         emitted in completion order.
         """
         return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
+
+    def batch(self, size: int) -> Pipeline[list[T]]:
+        """Return a pipeline that collects items into lists of up to `size`."""
+        return self | Flow._from_operator(functional.batch(size))
 
     def __aiter__(self) -> AsyncIterator[T]:
         """Iterate over the pipeline results asynchronously."""
