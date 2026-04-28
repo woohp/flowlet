@@ -13,6 +13,12 @@ from weakref import WeakKeyDictionary
 def in_thread[**P, R](
     fn: Callable[P, R], *, executor: ThreadPoolExecutor | None = None, limit: int | None = None
 ) -> Callable[P, Awaitable[R]]:
+    """Wrap a blocking sync callable so it runs in a thread pool.
+
+    The returned async callable can be used in pipeline stages. `limit` bounds
+    submissions for this wrapper; `executor=None` uses asyncio's default thread
+    pool.
+    """
     if _is_async_callable(fn):
         raise TypeError("in_thread() does not accept async callables")
     if limit is not None and limit < 1:
@@ -53,6 +59,11 @@ def in_thread[**P, R](
 
 
 def _is_async_callable(fn: Callable[..., object]) -> bool:
+    """Return true for coroutine or async-generator callables.
+
+    `functools.partial` wrappers are unwrapped so `in_thread` and `in_process`
+    reject async callables consistently even when arguments were pre-bound.
+    """
     candidate = cast(Any, fn)
     while isinstance(candidate, functools.partial):
         candidate = candidate.func

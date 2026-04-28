@@ -12,6 +12,8 @@ type Predicate[T] = Callable[[T], bool | Awaitable[bool]]
 
 
 class Operator[T, U](Protocol):
+    """Reusable stream transform from a source of `T` to async outputs of `U`."""
+
     def __call__(self, source: Source[T], /) -> AsyncIterator[U]: ...
 
 
@@ -34,6 +36,7 @@ type _QueueItem[T] = _Value[T] | _Error | _Done
 
 
 async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
+    """Yield items from an iterable or async iterable as an async iterator."""
     if isinstance(source, AsyncIterable):
         async for item in source:
             yield item
@@ -56,6 +59,11 @@ def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1) -> Operator[T, U]: 
 def map[T, U](  # noqa: A001
     fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1
 ) -> Operator[T, U]:
+    """Return an operator that applies `fn` to each source item.
+
+    `fn` may be sync or async. With `concurrency > 1`, outputs are yielded in
+    completion order.
+    """
     _validate_concurrency(concurrency)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
@@ -66,6 +74,11 @@ def map[T, U](  # noqa: A001
 
 
 def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1) -> Operator[T, U]:
+    """Return an operator that expands each source item into zero or more outputs.
+
+    `fn` may return an iterable, async iterable, or an awaitable resolving to
+    either. Concurrent expansions yield values as they become available.
+    """
     _validate_concurrency(concurrency)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
@@ -76,6 +89,12 @@ def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1) -> Operator[T, U
 
 
 def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Operator[T, T]:  # noqa: A001
+    """Return an operator that keeps items where `pred` returns true.
+
+    `pred` may be sync or async. With `concurrency > 1`, kept items are yielded
+    in completion order.
+    """
+
     async def expand(item: T) -> list[T]:
         return [item] if await _maybe_await(pred(item)) else []
 
@@ -109,6 +128,11 @@ def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]: ...
 
 
 def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
+    """Compose operators into one reusable stream transform.
+
+    With no operators, the returned transform is the identity operation.
+    """
+
     def apply(source: Source[Any]) -> AsyncIterator[Any]:
         if not operators:
             return to_async_iter(source)
@@ -122,10 +146,12 @@ def chain(*operators: Operator[Any, Any]) -> Operator[Any, Any]:
 
 
 async def collect[T](source: Source[T]) -> list[T]:
+    """Consume a source into a list."""
     return [item async for item in to_async_iter(source)]
 
 
 async def drain[T](source: Source[T]) -> None:
+    """Consume a source and discard all yielded values."""
     async for _ in to_async_iter(source):
         pass
 
@@ -136,10 +162,16 @@ async def for_each[T](
     *,
     concurrency: int = 1,
 ) -> None:
+    """Run `fn` for each item in `source` and consume the stream.
+
+    `fn` may be sync or async. Use `concurrency` to bound how many calls may be
+    in flight for this terminal stage.
+    """
     await drain(map(fn, concurrency=concurrency)(source))
 
 
 def _validate_concurrency(concurrency: int) -> None:
+    """Reject invalid stage concurrency before an operator is built."""
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
 
@@ -147,6 +179,12 @@ def _validate_concurrency(concurrency: int) -> None:
 async def _map[T, U](
     source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
 ) -> AsyncIterator[U]:
+    """Map a source lazily with bounded in-flight calls.
+
+    The sequential path avoids task scheduling overhead. The concurrent path
+    starts up to `concurrency` tasks and yields each result as soon as its task
+    completes, cancelling unfinished work if iteration stops or an error occurs.
+    """
     if concurrency == 1:
         async for item in to_async_iter(source):
             yield await _apply_map(fn, item)
@@ -193,10 +231,18 @@ async def _map[T, U](
 
 
 async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
+    """Apply a map function and await the result only when needed."""
     return await _maybe_await(fn(item))
 
 
 async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
+    """Flat-map a source with bounded concurrent expansions.
+
+    Each input gets an expansion task that streams values into a shared queue.
+    Queue messages distinguish yielded values, raised errors, and task
+    termination so downstream consumers can receive values as they arrive while
+    the driver still knows when to start more input work.
+    """
     source_iter = to_async_iter(source)
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     pending: dict[int, asyncio.Task[None]] = {}
@@ -239,6 +285,11 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
 
 
 async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queue[_QueueItem[U]], token: int) -> None:
+    """Run one flat-map expansion and publish its values or error to `queue`.
+
+    A final `_Done` message is always sent so `_flat_map` can retire this
+    expansion task even when the expansion raises.
+    """
     try:
         expanded = await _maybe_await(fn(item))
         if isinstance(expanded, AsyncIterable):
@@ -259,6 +310,7 @@ async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queu
 
 
 async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    """Cancel tasks and wait for cancellation cleanup to finish."""
     task_list = list(tasks)
     for task in task_list:
         task.cancel()
@@ -267,12 +319,18 @@ async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
 
 
 async def _close_async_iter(source: AsyncIterator[Any]) -> None:
+    """Close an async iterator when it exposes `aclose`.
+
+    This lets pipeline stages release upstream generators promptly when a
+    downstream consumer stops early or an error interrupts iteration.
+    """
     aclose = getattr(source, "aclose", None)
     if aclose is not None:
         await aclose()
 
 
 async def _maybe_await[T](value: T | Awaitable[T]) -> T:
+    """Return plain values unchanged and await awaitable values."""
     if inspect.isawaitable(value):
         return await value
     return value

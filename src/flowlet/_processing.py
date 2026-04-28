@@ -12,6 +12,12 @@ from flowlet._threading import _is_async_callable
 def in_process[**P, R](
     fn: Callable[P, R], *, executor: ProcessPoolExecutor, limit: int | None = None
 ) -> Callable[P, Awaitable[R]]:
+    """Wrap a CPU-bound sync callable so it runs in a process pool.
+
+    The returned async callable can be used in pipeline stages. `executor` is
+    required so callers own process lifetime; `limit` bounds submissions for
+    this wrapper.
+    """
     if _is_async_callable(fn):
         raise TypeError("in_process() does not accept async callables")
     if limit is not None and limit < 1:
