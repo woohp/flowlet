@@ -348,12 +348,13 @@ class TestInThread:
             await asyncio.sleep(0)
             return x
 
-        result = (
-            await pipe(range(200))
-            .map(in_thread(block, limit=8), concurrency=64)
-            .map(downstream, concurrency=4)
-            .collect()
-        )
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            result = (
+                await pipe(range(200))
+                .map(in_thread(block, executor=pool, limit=8), concurrency=64)
+                .map(downstream, concurrency=4)
+                .collect()
+            )
 
         assert sorted(result) == list(range(200))
         assert seen_by_downstream == 200
