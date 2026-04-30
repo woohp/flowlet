@@ -178,20 +178,6 @@ async def drain[T](source: Source[T]) -> None:
         pass
 
 
-async def for_each[T](
-    source: Source[T],
-    fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
-    *,
-    concurrency: int = 1,
-) -> None:
-    """Run `fn` for each item in `source` and consume the stream.
-
-    `fn` may be sync or async. Use `concurrency` to bound how many calls may be
-    in flight for this terminal stage.
-    """
-    await drain(map(fn, concurrency=concurrency)(source))
-
-
 def _validate_concurrency(concurrency: int) -> None:
     """Reject invalid stage concurrency before an operator is built."""
     if concurrency < 1:
@@ -369,7 +355,6 @@ __all__ = [
     "drain",
     "filter",
     "flat_map",
-    "for_each",
     "map",
     "to_async_iter",
 ]

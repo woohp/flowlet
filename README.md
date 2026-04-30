@@ -20,7 +20,7 @@ pip install flowlet
 
 ## Pipeline API
 
-The pipeline API is the default interface. It is method chaining over a lazy async stream; nothing runs until the pipeline is consumed with `async for` or a terminal method such as `.collect()`, `.for_each()`, or `.drain()`.
+The pipeline API is the default interface. It is method chaining over a lazy async stream; nothing runs until the pipeline is consumed with `async for` or a terminal method such as `.collect()`, or `.drain()`.
 
 ```python
 from flowlet import pipe
@@ -42,7 +42,6 @@ results = await (
 - `.batch(size)` collects items into lists of up to `size`.
 - `.through(flow)` appends a reusable `Flow` fragment.
 - `.collect()` consumes the pipeline into a list.
-- `.for_each(fn, concurrency=...)` runs a terminal side effect for each item.
 - `.drain()` consumes the pipeline when outputs are intentionally ignored.
 
 Functions may be sync or async.
@@ -233,8 +232,6 @@ items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
 # May return [3, 1, 2], not necessarily [1, 2, 3].
 ```
 
-`.for_each(...)` is implemented like `.map(fn, concurrency=...).drain()`, so terminal callbacks also run concurrently when `concurrency > 1`. If the callback mutates external state and that side effect must happen strictly in input order, use `concurrency=1`.
-
 ## Cardinality
 
 Use the method that matches the stage cardinality.
@@ -262,9 +259,9 @@ await pipe(records).batch(100).map(bulk_insert).drain()
 
 `pipe(source)` and `F.collect(source)` accept iterables and async iterables. They consume the source lazily. One-shot iterators and generators remain one-shot if reused across multiple pipeline runs.
 
-`.collect()` on an infinite source never completes because it waits to build a complete list. Use async iteration, `.for_each(...)`, or `.drain()` for unbounded streams.
+`.collect()` on an infinite source never completes because it waits to build a complete list. Use async iteration or `.drain()` for unbounded streams.
 
-Use `.for_each(fn, concurrency=...)` when the terminal action is a side effect for each output item. Use `.drain()` when side effects are inside the pipeline stages and no per-item action is needed at the terminal - the pipeline is just drained to completion.
+Use `.drain()` when side effects are inside the pipeline stages and no per-item action is needed at the terminal - the pipeline is just drained to completion.
 
 ```python
 await pipe(events).map(write_to_log, concurrency=20).drain()

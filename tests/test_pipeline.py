@@ -596,63 +596,6 @@ class TestSourcesAndTerminals:
         await asyncio.wait_for(cancelled.wait(), timeout=0.1)
 
     @pytest.mark.asyncio
-    async def test_for_each_runs_side_effects(self) -> None:
-        output: list[int] = []
-
-        await pipe([1, 2, 3]).for_each(lambda x: output.append(x))
-
-        assert sorted(output) == [1, 2, 3]
-
-    @pytest.mark.asyncio
-    async def test_for_each_supports_concurrency(self) -> None:
-        output: list[int] = []
-
-        async def append_slowly(x: int) -> None:
-            await asyncio.sleep((3 - x) * 0.01)
-            output.append(x)
-
-        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=3)
-
-        assert sorted(output) == [1, 2, 3]
-
-    @pytest.mark.asyncio
-    async def test_for_each_uses_concurrency_by_default(self) -> None:
-        running = 0
-        max_running = 0
-
-        async def track_running(_: int) -> None:
-            nonlocal max_running, running
-            running += 1
-            max_running = max(max_running, running)
-            await asyncio.sleep(0.01)
-            running -= 1
-
-        await pipe([1, 2, 3]).for_each(track_running, concurrency=3)
-
-        assert max_running == 3
-
-    @pytest.mark.asyncio
-    async def test_for_each_with_concurrency_one_runs_serially(self) -> None:
-        output: list[int] = []
-
-        async def append_slowly(x: int) -> None:
-            await asyncio.sleep((3 - x) * 0.01)
-            output.append(x)
-
-        await pipe([1, 2, 3]).for_each(append_slowly, concurrency=1)
-
-        assert output == [1, 2, 3]
-
-    @pytest.mark.asyncio
-    async def test_for_each_propagates_errors(self) -> None:
-        async def boom(x: int) -> None:
-            if x == 2:
-                raise RuntimeError("boom")
-
-        with pytest.raises(RuntimeError, match="boom"):
-            await pipe([1, 2, 3]).for_each(boom, concurrency=2)
-
-    @pytest.mark.asyncio
     async def test_drain_drains_pipeline(self) -> None:
         output: list[int] = []
 

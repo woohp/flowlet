@@ -176,19 +176,6 @@ class Pipeline[T]:
         """Consume the pipeline, discarding any yielded values."""
         await functional.drain(self)
 
-    async def for_each(
-        self,
-        fn: Callable[[T], object] | Callable[[T], Awaitable[object]],
-        *,
-        concurrency: int = 1,
-    ) -> None:
-        """Run `fn` for each item and consume the pipeline.
-
-        Use this for terminal side effects. `fn` may be sync or async and runs
-        with the requested stage-level concurrency.
-        """
-        await functional.for_each(self, fn, concurrency=concurrency)
-
     def through[U](self, flow: Flow[T, U]) -> Pipeline[U]:
         """Return a new pipeline with `flow` appended after current steps."""
         return Pipeline(self._source, (*self._operators, *flow._operators))
