@@ -3,6 +3,7 @@ name = "flowlet"
 version = "0.1.0"
 description = "A minimal async pipeline library"
 readme = "README.md"
+license = "BSD-3-Clause"
 requires-python = ">=3.13"
 dependencies = []
 
