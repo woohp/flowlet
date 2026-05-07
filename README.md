@@ -1,6 +1,8 @@
 # flowlet
 
-`flowlet` is a small async pipeline library for transforming streams with bounded stage-level parallelism.
+`flowlet` is an async pipeline library for transforming streams with bounded, per-stage concurrency.
+
+Give it some data, add a few steps, and consume the results. Slow steps can run concurrently without turning the code into a tangle of queues and tasks.
 
 ## Requirements
 
@@ -9,44 +11,188 @@
 ## Installation
 
 ```bash
-uv add flowlet
-```
-
-or:
-
-```bash
 pip install flowlet
 ```
 
-## Pipeline API
-
-The pipeline API is the default interface. It is method chaining over a lazy async stream; nothing runs until the pipeline is consumed with `async for` or a terminal method such as `.collect()`, or `.drain()`.
+## Quick start
 
 ```python
+import asyncio
 from flowlet import pipe
 
-results = await (
-    pipe(urls)
-    .map(fetch, concurrency=20)
-    .flat_map(extract_links)
-    .filter(is_valid)
-    .map(normalize)
-    .collect()
-)
+
+async def main():
+    result = await (
+        pipe([1, 2, 3, 4, 5])
+        .map(lambda n: n * 2)
+        .filter(lambda n: n > 5)
+        .collect()
+    )
+
+    print(result)
+
+
+asyncio.run(main())
 ```
 
-- `pipe(source)` accepts an `Iterable[T]` or `AsyncIterable[T]`.
-- `.map(fn)` transforms one input into one output.
-- `.flat_map(fn)` transforms one input into zero or more outputs.
-- `.filter(pred)` keeps or drops each input.
-- `.batch(size)` collects items into lists of up to `size`.
-- `.through(flow)` appends a reusable `Flow` fragment.
-- `.collect()` consumes the pipeline into a list.
-- `.drain()` consumes the pipeline when outputs are intentionally ignored.
+Output:
 
-Functions may be sync or async.
+```python
+[6, 8, 10]
+```
 
-Use `in_thread(...)` for blocking synchronous work that should not run on the event loop:
+That is the main API: `pipe(source)`, chain stages like `.map(...)`, then consume with `.collect()`, `.drain()`, or `async for`.
+
+**Pipelines are lazy.** Nothing runs until you consume the results with a collector or an `async for` loop.
+
+## Concurrency and order
+
+Concurrency is configured per stage.
+
+```python
+items = await pipe(urls).map(fetch, concurrency=20).collect()
+```
+
+- **`concurrency=1` (Default)**: Stages process items one at a time. The next item is pulled from the source only after the current one is yielded downstream.
+- **`concurrency > 1`**: The stage eagerly starts up to `concurrency` calls at once and yields results as they complete. Backpressure is implicit: if the downstream consumer is slow, the stage pauses and stops pulling from the source.
+
+**Concurrent stages emit values in completion order.** A faster later item can be yielded before a slower earlier item. If you need to preserve input order, use `concurrency=1`.
+
+```python
+# May return [3, 1, 2], not necessarily [1, 2, 3]
+items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
+```
+
+## Pipeline stages
+
+### Transform items with `map`
+
+Use `.map(...)` when each input produces exactly one output.
+
+```python
+names = await pipe(users).map(lambda user: user.name).collect()
+```
+
+The function may be async:
+
+```python
+pages = await pipe(urls).map(fetch_page, concurrency=20).collect()
+```
+
+### Filter items with `filter`
+
+Use `.filter(...)` when each input should be kept or dropped.
+
+```python
+active = await pipe(users).filter(lambda user: user.is_active).collect()
+```
+
+### Expand items with `flat_map`
+
+Use `.flat_map(...)` when each input can produce zero, one, or many outputs.
+
+```python
+links = await pipe(pages).flat_map(extract_links).collect()
+```
+
+`flat_map(fn)` accepts a sync or async function returning an iterable or async iterable. Each returned iterable is streamed into the pipeline; an async expansion can yield values before the whole expansion has finished.
+
+Use `.map(fn)` instead if `fn` returns a single scalar value.
+
+`None` is treated as normal data. Filtering is always explicit.
+
+### Batch items with `batch`
+
+Use `.batch(size)` to group items into lists of up to `size`.
+
+```python
+await pipe(records).batch(100).map(bulk_insert).drain()
+```
+
+```python
+await pipe([1, 2, 3, 4, 5]).batch(2).collect()
+# [[1, 2], [3, 4], [5]]
+```
+
+The last emitted list may be shorter when the source is exhausted with a partial group. Batching is useful for API calls, database inserts, and any operation that benefits from processing items in chunks.
+
+### Consume with `async for`
+
+Pipelines are async iterables. Use `async for` when you do not want to collect every item, especially for unbounded streams.
+
+```python
+async for link in pipe(events).map(parse).filter(is_interesting):
+    await handle(link)
+```
+
+Stop the loop normally when you have enough items:
+
+```python
+items = []
+
+async for item in pipe(events).map(parse):
+    items.append(item)
+    if len(items) == 100:
+        break
+```
+
+### Drain for side effects
+
+Use `.drain()` when the pipeline stages do the useful work and the final output is not needed.
+
+```python
+await pipe(events).map(write_to_log, concurrency=20).drain()
+```
+
+## API reference
+
+| API | Purpose | Cardinality |
+| :--- | :--- | :--- |
+| `pipe(source)` | Start a pipeline | — |
+| `.map(fn)` | Transform each item | 1 → 1 |
+| `.filter(pred)` | Keep or drop items | 1 → 0..1 |
+| `.flat_map(fn)` | Expand into multiple items | 1 → 0..N |
+| `.batch(size)` | Group items into lists | N → 1 |
+| `.through(flow)` | Apply a reusable `Flow` | Varies |
+| `.collect()` | Consume into a `list` | Consumer |
+| `.drain()` | Consume and discard output | Consumer |
+
+`flat_map(fn)` expects finite expansions. Outputs are buffered internally; very large expansions may consume significant memory.
+
+With `flat_map(in_thread(fn))`, prefer returning a materialized collection such as `list` or `tuple`. If `fn` returns a lazy generator, the generator object is created in the worker thread but iterated later on the event-loop thread.
+
+## Composition and reuse
+
+`Flow` is a sourceless pipeline fragment. Use it to name and reuse transformations.
+
+```python
+from flowlet import Flow, pipe
+
+# Define a reusable flow
+# Flow[InputType]() starts a fragment with the given input type
+extract: Flow[Page, str] = (
+    Flow[Page]()
+    .flat_map(find_links)
+    .filter(is_internal)
+    .map(normalize_url)
+)
+
+links = await pipe(pages).through(extract).collect()
+```
+
+### Type hinting
+
+- `Flow[T]()` starts a fragment where the input is type `T`.
+- `Flow[T, U]` is the type of a fragment that takes `T` and produces `U`.
+- Bare `Flow()` produces `Flow[Any, Any]`. Prefer `Flow[T]()` so type checkers can verify your pipeline.
+
+## Blocking synchronous work
+
+Do not run blocking synchronous work directly on the event loop. Wrap it with `in_thread(...)` or `in_process(...)` depending on the kind of work.
+
+### Blocking I/O with `in_thread`
+
+Use `in_thread(...)` for blocking synchronous work that should run in a thread, such as filesystem calls, blocking SDKs, or blocking network clients.
 
 ```python
 from flowlet import in_thread, pipe
@@ -54,7 +200,17 @@ from flowlet import in_thread, pipe
 items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
 ```
 
-`in_thread(fn, limit=16)` adds a wrapper-level throttle. `concurrency` still controls how many items the pipeline stage may have in flight. With `.map(in_thread(fn, limit=16), concurrency=64)`, up to 64 items may be active in the stage while at most 16 wrapped calls are submitted to the executor at once. That `limit` is enforced per wrapped callable per event loop, so the same wrapper can be reused safely across separate `asyncio.run(...)` calls.
+### Concurrency vs. limits
+
+When using `in_thread` or `in_process`, the number of active calls is bounded by:
+
+- **`concurrency`**: How many items the pipeline stage pulls from the source.
+- **`limit`**: A throttle on the wrapper itself, per event loop.
+- **`executor`**: The capacity of the underlying thread or process pool.
+
+The effective number of submitted calls is limited by the stage concurrency, the wrapper limit if provided, and the executor's worker capacity.
+
+For example, `.map(in_thread(fn, limit=16), concurrency=64)` allows 64 items to be "in flight" in the pipeline, but at most 16 calls will be submitted to the thread pool simultaneously.
 
 Cancellation stops waiting for a threaded call's result, but it does not interrupt synchronous code that is already running in a worker thread.
 
@@ -77,7 +233,9 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 Pass a `ThreadPoolExecutor` when using `executor=...`. `in_thread(...)` is for blocking thread-based work, not process pools.
 
-Use `in_process(...)` for CPU-bound synchronous work that should run in a process pool:
+### CPU-bound work with `in_process`
+
+Use `in_process(...)` for CPU-bound synchronous work that should run in a process pool.
 
 ```python
 from concurrent.futures import ProcessPoolExecutor
@@ -87,60 +245,25 @@ with ProcessPoolExecutor(max_workers=8) as pool:
     items = await pipe(keys).map(in_process(crunch, executor=pool), concurrency=8).collect()
 ```
 
-Unlike `in_thread(...)`, `in_process(...)` has no default executor. `in_thread(...)` can use asyncio's default thread pool, but process pools must be explicitly started and shut down, so `in_process(fn, executor=pool, limit=...)` always requires a `ProcessPoolExecutor`. For the usual case, set `concurrency` to the process pool size and omit `limit`; use `limit` only when this wrapper should submit fewer calls than the stage or executor would otherwise allow.
+Unlike `in_thread(...)`, which can fall back to asyncio's default thread pool, `in_process(...)` always requires an explicit `ProcessPoolExecutor` because process pools must be created and shut down explicitly.
 
-The wrapped function, its arguments, and its return values must be pickleable for cross-platform process-pool code. The default start method varies by platform and Python version: `fork` on Linux before Python 3.14 (where local functions and lambdas work), `forkserver` on Linux from Python 3.14 onwards, and `spawn` on macOS and Windows — both `forkserver` and `spawn` require importable module-level functions. Use module-level functions for portable in_process(...) pipelines.
+For the usual case, set `concurrency` to the process pool size and omit `limit`. Use `limit` only when this wrapper should submit fewer calls than the stage or executor would otherwise allow.
 
-`in_process(...)` does not propagate `contextvars` into workers. `in_thread(...)` can copy context into another thread in the same process, but `contextvars.Context` is not pickleable and cannot be sent to worker processes. Cancellation stops waiting for the process-pool result, but a task that is already running in a `ProcessPoolExecutor` cannot be cancelled individually; use `concurrency`, `limit`, or the executor's worker count as the practical throttles.
+The wrapped function, its arguments, and its return values must be pickleable for cross-platform process-pool code. The default start method varies by platform and Python version:
 
-## Reusable Flows
+- Linux before Python 3.14: `fork`, where local functions and lambdas work.
+- Linux from Python 3.14 onward: `forkserver`.
+- macOS and Windows: `spawn`.
 
-`Flow` is the reusable sourceless pipeline fragment type. Use it when you want to name and reuse a transform.
+Both `forkserver` and `spawn` require importable module-level functions. Use module-level functions for portable `in_process(...)` pipelines.
 
-```python
-from flowlet import Flow, pipe
+`in_process(...)` does not propagate `contextvars` into workers. `in_thread(...)` can copy context into another thread in the same process, but `contextvars.Context` is not pickleable and cannot be sent to worker processes.
 
-extract: Flow[Page, str] = (
-    Flow[Page]()
-    .flat_map(find_links)
-    .filter(is_internal)
-    .map(normalize_url)
-)
+Cancellation stops waiting for the process-pool result, but a task that is already running in a `ProcessPoolExecutor` cannot be cancelled individually. Use `concurrency`, `limit`, or the executor's worker count as the practical throttles.
 
-links = await pipe(pages).through(extract).collect()
-```
+## Pipe operator syntax
 
-`Flow[T]()` starts a fragment whose input and current output type are both `T`. Starting from bare `Flow()` is allowed, but type checkers cannot infer the fragment input type from no source. Prefer `Flow[T]()` for typed reusable fragments.
-
-The `|` syntax is optional sugar for `.through(...)`:
-
-```python
-links = await (pipe(pages) | extract).collect()
-```
-
-## Async Iteration
-
-Pipelines are async iterables. Use `async for` when you do not want to collect every item, especially for unbounded streams.
-
-```python
-async for link in pipe(events).map(parse).filter(is_interesting):
-    await handle(link)
-```
-
-Stop the loop normally when you have enough items:
-
-```python
-items = []
-
-async for item in pipe(events).map(parse):
-    items.append(item)
-    if len(items) == 100:
-        break
-```
-
-## Operator Syntax
-
-The `op` namespace constructs single-step `Flow`s for compact reusable composition. It is secondary to method chaining and does not change execution behavior.
+If you prefer an operator-based style, you can use the `|` operator with the `op` namespace. This is a stylistic alternative to fluent method chaining and does not change execution behavior.
 
 ```python
 from flowlet import op, pipe
@@ -153,25 +276,11 @@ items = await (
 ).collect()
 ```
 
-This is equivalent to:
-
-```python
-items = await (
-    pipe(pages)
-    .flat_map(find_links)
-    .filter(is_internal)
-    .map(normalize_url)
-    .collect()
-)
-```
-
 `pipe(source) | flow` is equivalent to `pipe(source).through(flow)`.
 
-Use `op` when you want compact sourceless flow composition:
+The `op` namespace constructs single-step `Flow`s. Composing them with `|` produces a multi-step `Flow` that can be named and reused:
 
 ```python
-from flowlet import op, pipe
-
 extract = (
     op.flat_map(find_links)
     | op.filter(is_internal)
@@ -183,86 +292,51 @@ links = await (pipe(pages) | extract).collect()
 
 ## Functional API
 
-`flowlet.functional` is a lower-level API. It exposes the curried stream operators that power `Pipeline`, `Flow`, and `op`.
+For users who prefer a functional style over fluent method chaining, `flowlet.functional` provides curried operators that can be composed using `chain`.
 
 ```python
 import flowlet.functional as F
 
-pipeline = F.chain(
+# Build a reusable transformer function
+process = F.chain(
     F.map(fetch, concurrency=20),
     F.flat_map(extract_links),
     F.filter(is_valid),
-    F.map(normalize),
 )
 
-items = await F.collect(pipeline(urls))
+# Apply it to a source
+items = await F.collect(process(urls))
 ```
 
-Each functional operator returns a reusable stream transformer:
+Each functional operator is a standalone transformer function:
 
 ```python
 fetch_pages = F.map(fetch, concurrency=20)
-pages = fetch_pages(urls)
+pages = fetch_pages(urls)  # Returns an AsyncIterator
 ```
 
-Most users should prefer the pipeline API. Use `flowlet.functional` when you specifically want to build or pass around stream-transformer functions.
+## Behavior reference
 
-## Error Behavior
+### Errors
 
-The default error policy is fail-fast. Exceptions from sources or stages propagate to the caller.
+The default policy is **fail-fast**. If a stage raises an exception, the pipeline raises immediately and pending tasks are cancelled.
 
-In a concurrent stage, if one in-flight item raises, the pipeline raises and pending sibling tasks in that stage are cancelled. There is no skip-or-recover API yet; use explicit `try`/`except` inside your stage function if you want to convert failures into values or filter them with `.flat_map(...)`.
-
-## Concurrency
-
-Concurrency is configured per stage. A pipeline with two `concurrency=20` stages can have work in flight in both stages at the same time as downstream consumption allows.
-
-Concurrent stages emit values in completion order. If you need input order, use `concurrency=1`.
+To handle errors without stopping the pipeline, use `try`/`except` inside your stage function. Use `.flat_map(...)` so failures can produce zero outputs:
 
 ```python
-items = await pipe(urls).map(fetch, concurrency=20).collect()
+async def safe_fetch(url):
+    try:
+        return [await fetch(url)]
+    except Exception:
+        return []
+
+items = await pipe(urls).flat_map(safe_fetch, concurrency=20).collect()
 ```
 
-With `concurrency > 1`, a faster later item can be yielded before a slower earlier item. Source items are pulled lazily, up to the stage concurrency and downstream demand.
+### Sources
 
-This applies to every concurrent stage, including filters:
+`pipe(source)` and `F.collect(source)` accept iterables and async iterables. They consume the source lazily.
 
-```python
-items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
-# May return [3, 1, 2], not necessarily [1, 2, 3].
-```
-
-## Cardinality
-
-Use the method that matches the stage cardinality.
-
-```python
-pipe(items).map(fn)       # one input -> one output
-pipe(items).filter(pred)  # one input -> zero or one output
-pipe(items).flat_map(fn)  # one input -> zero or more outputs
-pipe(items).batch(size)   # many inputs -> one output (list)
-```
-
-`flat_map(fn)` accepts a sync or async function returning an `Iterable[U]` or `AsyncIterable[U]`. It streams each returned iterable; an async expansion can yield values without first finishing the whole expansion. It expects each input to expand into a finite, reasonably small iterable or async iterable. Outputs are buffered internally; very large or infinite expansions may consume unbounded memory. It does not accept a single scalar output; use `.map(fn)` for one-to-one transforms.
-
-With `flat_map(in_thread(fn))`, prefer returning a materialized collection such as `list` or `tuple`. If `fn` returns a lazy generator, the generator object is created in the worker thread but iterated later on the event-loop thread.
-
-`batch(size)` collects items into lists of up to `size`. The last emitted list may be shorter when the source is exhausted with a partial group. This is useful for batching API calls, database inserts, or any operation that benefits from processing items in chunks:
-
-```python
-await pipe(records).batch(100).map(bulk_insert).drain()
-```
-
-`None` is treated as normal data. Filtering is explicit.
-
-## Source Contract
-
-`pipe(source)` and `F.collect(source)` accept iterables and async iterables. They consume the source lazily. One-shot iterators and generators remain one-shot if reused across multiple pipeline runs.
+One-shot iterators and generators remain one-shot if reused across multiple pipeline runs.
 
 `.collect()` on an infinite source never completes because it waits to build a complete list. Use async iteration or `.drain()` for unbounded streams.
-
-Use `.drain()` when side effects are inside the pipeline stages and no per-item action is needed at the terminal - the pipeline is just drained to completion.
-
-```python
-await pipe(events).map(write_to_log, concurrency=20).drain()
-```
