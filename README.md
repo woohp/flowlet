@@ -233,6 +233,54 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 Pass a `ThreadPoolExecutor` when using `executor=...`. `in_thread(...)` is for blocking thread-based work, not process pools.
 
+### Per-thread resources with `thread_local`
+
+Use `thread_local` for blocking clients or sessions that should be created once per worker thread and reused by later tasks on that same thread.
+
+```python
+from flowlet import in_thread, pipe, thread_local
+
+@thread_local
+def s3():
+    client = boto3.client("s3", region_name="us-east-1")
+    try:
+        yield client
+    finally:
+        client.close()
+
+def load_s3(key):
+    return s3().get_object(Bucket="my-bucket", Key=key)
+
+items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
+```
+
+Plain factories are also supported when no cleanup is needed. For generator factories, the first yielded value is cached per calling thread; the generator is never resumed and is closed during teardown. `s3.close()` explicitly closes only the current thread's resource and clears that thread's cache.
+
+To clean up worker resources at a defined point, use an explicit `ThreadPoolExecutor` context manager. When the context exits, the pool shuts down, its worker threads exit, and the per-thread generators created on those workers are closed:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+from flowlet import in_thread, pipe, thread_local
+
+@thread_local
+def session():
+    client = HttpClient()
+    try:
+        yield client
+    finally:
+        # Runs once per worker thread as the pool shuts down.
+        client.close()
+
+def fetch(url):
+    return session().get(url)
+
+with ThreadPoolExecutor(max_workers=16) as pool:
+    pages = await pipe(urls).map(in_thread(fetch, executor=pool), concurrency=64).collect()
+# after the with block, pool threads have exited and their sessions are closed
+```
+
+This only cleans up resources initialized on that executor's worker threads. Resources initialized on other threads, such as asyncio's default thread pool, are unaffected until those threads exit or call `.close()` themselves.
+
 ### CPU-bound work with `in_process`
 
 Use `in_process(...)` for CPU-bound synchronous work that should run in a process pool.

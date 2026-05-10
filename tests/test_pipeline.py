@@ -5,14 +5,14 @@ import functools
 import multiprocessing as mp
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Any, cast
 
 import pytest
 
 import flowlet.functional as F
-from flowlet import Flow, Pipeline, in_process, in_thread, op, pipe
+from flowlet import Flow, Pipeline, in_process, in_thread, op, pipe, thread_local
 
 
 async def double(x: int) -> int:
@@ -796,3 +796,174 @@ def test_typing_surface() -> None:
     assert isinstance(batched_flow, Flow)
     assert isinstance(batched_op, Flow)
     assert batched_functional is not None
+
+
+class TestThreadLocal:
+    def test_lazy_reuses_and_explicit_close(self) -> None:
+        created: list[int] = []
+        closed: list[int] = []
+
+        @thread_local
+        def resource() -> Generator[dict[str, int]]:
+            value = len(created)
+            created.append(value)
+            try:
+                yield {"value": value}
+            finally:
+                closed.append(value)
+
+        assert created == []
+        first = resource()
+        assert first is resource()
+        assert created == [0]
+
+        resource.close()
+        assert closed == [0]
+        second = resource()
+        assert second is not first
+        assert second == {"value": 1}
+        assert created == [0, 1]
+        resource.close()
+        resource.close()
+        assert closed == [0, 1]
+
+    def test_plain_factory_reuses_without_cleanup(self) -> None:
+        calls = 0
+
+        @thread_local
+        def resource() -> object:
+            nonlocal calls
+            calls += 1
+            return object()
+
+        first = resource()
+        assert first is resource()
+        assert calls == 1
+        resource.close()
+        assert resource() is not first
+        assert calls == 2
+
+    def test_close_before_init_is_noop(self) -> None:
+        @thread_local
+        def resource() -> object:
+            return object()
+
+        resource.close()
+
+    def test_threads_get_independent_resources_and_thread_death_cleans_up(self) -> None:
+        barrier = threading.Barrier(3)
+        seen: list[tuple[int, int]] = []
+        closed: list[int] = []
+        lock = threading.Lock()
+
+        @thread_local
+        def resource() -> Generator[object]:
+            value = threading.get_ident()
+            try:
+                yield object()
+            finally:
+                with lock:
+                    closed.append(value)
+
+        def worker() -> None:
+            first = resource()
+            second = resource()
+            with lock:
+                seen.append((id(first), id(second)))
+            barrier.wait()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        assert len(seen) == 2
+        assert seen[0][0] == seen[0][1]
+        assert seen[1][0] == seen[1][1]
+        assert seen[0][0] != seen[1][0]
+        assert len(closed) == 2
+
+    def test_cache_cleared_before_cleanup_and_after_cleanup_error(self) -> None:
+        values: list[int] = []
+        fail_cleanup = True
+
+        @thread_local
+        def resource() -> Generator[int]:
+            nonlocal fail_cleanup
+            value = len(values)
+            values.append(value)
+            try:
+                yield value
+            finally:
+                if fail_cleanup:
+                    fail_cleanup = False
+                    raise RuntimeError("boom")
+
+        assert resource() == 0
+        with pytest.raises(RuntimeError, match="boom"):
+            resource.close()
+        assert resource() == 1
+        resource.close()
+
+    def test_error_cases(self) -> None:
+        @thread_local
+        def empty() -> Generator[object]:
+            yield from ()
+
+        with pytest.raises(RuntimeError, match="empty"):
+            empty()
+
+        async def async_gen() -> AsyncIterator[object]:
+            yield object()
+
+        async def coroutine_factory() -> object:
+            return object()
+
+        with pytest.raises(TypeError, match="synchronous"):
+            thread_local(async_gen)
+        with pytest.raises(TypeError, match="synchronous"):
+            thread_local(coroutine_factory)
+
+    def test_multiple_locals_do_not_interfere(self) -> None:
+        @thread_local
+        def a() -> list[int]:
+            return []
+
+        @thread_local
+        def b() -> list[int]:
+            return []
+
+        a().append(1)
+        b().append(2)
+        assert a() == [1]
+        assert b() == [2]
+
+    @pytest.mark.asyncio
+    async def test_in_thread_reuses_one_resource_per_worker_and_scoped_cleanup(self) -> None:
+        created: set[int] = set()
+        closed: set[int] = set()
+        lock = threading.Lock()
+
+        @thread_local
+        def resource() -> Generator[int]:
+            thread_id = threading.get_ident()
+            with lock:
+                created.add(thread_id)
+            try:
+                yield thread_id
+            finally:
+                with lock:
+                    closed.add(thread_id)
+
+        def use_resource(_: int) -> int:
+            return resource()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            result = await pipe(range(40)).map(in_thread(use_resource, executor=pool), concurrency=40).collect()
+            assert set(result) == created
+            assert len(created) <= 4
+            assert closed == set()
+
+        assert closed == created
