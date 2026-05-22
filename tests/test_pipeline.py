@@ -37,16 +37,6 @@ def process_expand(x: int) -> list[int]:
     return [x, x * 10]
 
 
-def process_sleep_and_track(x: int, running: Any, max_running: Any, lock: Any) -> int:
-    with lock:
-        running.value += 1
-        max_running.value = max(max_running.value, running.value)
-    time.sleep(0.05)
-    with lock:
-        running.value -= 1
-    return x
-
-
 class TestPipelineApi:
     @pytest.mark.asyncio
     async def test_method_chain_collects_results(self) -> None:
@@ -236,27 +226,6 @@ class TestInThread:
         assert sorted(result) == [2, 4, 6]
 
     @pytest.mark.asyncio
-    async def test_in_thread_limit_bounds_parallelism(self) -> None:
-        running = 0
-        max_running = 0
-        lock = threading.Lock()
-
-        def block(x: int) -> int:
-            nonlocal max_running, running
-            with lock:
-                running += 1
-                max_running = max(max_running, running)
-            time.sleep(0.02)
-            with lock:
-                running -= 1
-            return x
-
-        result = await pipe(range(6)).map(in_thread(block, limit=2), concurrency=6).collect()
-
-        assert sorted(result) == list(range(6))
-        assert max_running == 2
-
-    @pytest.mark.asyncio
     async def test_in_thread_supports_filter_and_flat_map(self) -> None:
         filtered = await pipe([1, 2, 3, 4]).filter(in_thread(lambda x: x % 2 == 0), concurrency=1).collect()
         expanded = await pipe([1, 2]).flat_map(in_thread(lambda x: [x, x * 10]), concurrency=1).collect()
@@ -349,7 +318,7 @@ class TestInThread:
         with ThreadPoolExecutor(max_workers=8) as pool:
             result = (
                 await pipe(range(200))
-                .map(in_thread(block, executor=pool, limit=8), concurrency=64)
+                .map(in_thread(block, executor=pool), concurrency=8)
                 .map(downstream, concurrency=4)
                 .collect()
             )
@@ -392,8 +361,8 @@ class TestInThread:
         with ThreadPoolExecutor(max_workers=4, thread_name_prefix="flowlet-shared") as pool:
             result = (
                 await pipe(range(40))
-                .map(in_thread(stage_one, executor=pool, limit=3), concurrency=16)
-                .map(in_thread(stage_two, executor=pool, limit=2), concurrency=16)
+                .map(in_thread(stage_one, executor=pool), concurrency=3)
+                .map(in_thread(stage_two, executor=pool), concurrency=2)
                 .collect()
             )
 
@@ -423,10 +392,6 @@ class TestInThread:
         with pytest.raises(TypeError, match="async callables"):
             in_thread(async_gen)
 
-    def test_in_thread_rejects_invalid_limit(self) -> None:
-        with pytest.raises(ValueError, match="limit"):
-            in_thread(lambda x: x, limit=0)
-
     def test_in_thread_preserves_function_metadata(self) -> None:
         def named(x: int) -> int:
             """docstring"""
@@ -438,38 +403,6 @@ class TestInThread:
         assert wrapped.__name__ == "named"
         assert wrapped.__doc__ == "docstring"
 
-    def test_in_thread_wrapper_can_be_reused_across_event_loops(self) -> None:
-        running = 0
-        max_running = 0
-        lock = threading.Lock()
-
-        def block(x: int) -> int:
-            nonlocal max_running, running
-            with lock:
-                running += 1
-                max_running = max(max_running, running)
-            time.sleep(0.01)
-            with lock:
-                running -= 1
-            return x
-
-        wrapped = in_thread(block, limit=2)
-
-        async def run_once() -> tuple[list[int], int]:
-            nonlocal max_running, running
-
-            result = await pipe(range(6)).map(wrapped, concurrency=6).collect()
-            return result, max_running
-
-        first_result, first_max = asyncio.run(run_once())
-        max_running = 0
-        second_result, second_max = asyncio.run(run_once())
-
-        assert sorted(first_result) == list(range(6))
-        assert sorted(second_result) == list(range(6))
-        assert first_max == 2
-        assert second_max == 2
-
 
 class TestInProcess:
     @pytest.mark.asyncio
@@ -479,21 +412,6 @@ class TestInProcess:
             result = await pipe([1, 2, 3]).map(in_process(process_double, executor=pool), concurrency=3).collect()
 
         assert sorted(result) == [2, 4, 6]
-
-    @pytest.mark.asyncio
-    async def test_in_process_limit_bounds_parallelism(self) -> None:
-        ctx = mp.get_context("fork")
-        with mp.Manager() as manager:
-            running = manager.Value("i", 0)
-            max_running = manager.Value("i", 0)
-            lock = manager.Lock()
-            task = functools.partial(process_sleep_and_track, running=running, max_running=max_running, lock=lock)
-
-            with ProcessPoolExecutor(max_workers=4, mp_context=ctx) as pool:
-                result = await pipe(range(6)).map(in_process(task, executor=pool, limit=2), concurrency=6).collect()
-
-            assert sorted(result) == list(range(6))
-            assert max_running.value == 2
 
     @pytest.mark.asyncio
     async def test_in_process_supports_filter_and_flat_map(self) -> None:
@@ -539,11 +457,6 @@ class TestInProcess:
             pytest.raises(TypeError, match="async callables"),
         ):
             in_process(async_gen, executor=pool)
-
-    def test_in_process_rejects_invalid_limit(self) -> None:
-        ctx = mp.get_context("fork")
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool, pytest.raises(ValueError, match="limit"):
-            in_process(process_double, executor=pool, limit=0)
 
     def test_in_process_preserves_function_metadata(self) -> None:
         ctx = mp.get_context("fork")
