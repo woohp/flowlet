@@ -200,21 +200,16 @@ from flowlet import in_thread, pipe
 items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
 ```
 
-### Concurrency vs. limits
+### Concurrency and executors
 
 When using `in_thread` or `in_process`, the number of active calls is bounded by:
 
 - **`concurrency`**: How many items the pipeline stage pulls from the source.
-- **`limit`**: A throttle on the wrapper itself, per event loop.
 - **`executor`**: The capacity of the underlying thread or process pool.
 
-The effective number of submitted calls is limited by the stage concurrency, the wrapper limit if provided, and the executor's worker capacity.
-
-For example, `.map(in_thread(fn, limit=16), concurrency=64)` allows 64 items to be "in flight" in the pipeline, but at most 16 calls will be submitted to the thread pool simultaneously.
+The effective amount of blocking work is capped by the smaller of the stage concurrency and the executor's worker capacity.
 
 Cancellation stops waiting for a threaded call's result, but it does not interrupt synchronous code that is already running in a worker thread.
-
-If you pass both `executor=pool` and `limit=16`, both bounds apply: `limit` throttles this wrapper, while `pool.max_workers` remains the actual thread-pool-wide cap.
 
 If multiple stages should share one thread pool, pass the same executor to each wrapper:
 
@@ -225,8 +220,8 @@ from flowlet import in_thread, pipe
 with ThreadPoolExecutor(max_workers=16) as pool:
     items = await (
         pipe(keys)
-        .map(in_thread(load_s3, executor=pool, limit=8), concurrency=32)
-        .map(in_thread(parse_blob, executor=pool, limit=4), concurrency=32)
+        .map(in_thread(load_s3, executor=pool), concurrency=8)
+        .map(in_thread(parse_blob, executor=pool), concurrency=4)
         .collect()
     )
 ```
@@ -295,8 +290,6 @@ with ProcessPoolExecutor(max_workers=8) as pool:
 
 Unlike `in_thread(...)`, which can fall back to asyncio's default thread pool, `in_process(...)` always requires an explicit `ProcessPoolExecutor` because process pools must be created and shut down explicitly.
 
-For the usual case, set `concurrency` to the process pool size and omit `limit`. Use `limit` only when this wrapper should submit fewer calls than the stage or executor would otherwise allow.
-
 The wrapped function, its arguments, and its return values must be pickleable for cross-platform process-pool code. The default start method varies by platform and Python version:
 
 - Linux before Python 3.14: `fork`, where local functions and lambdas work.
@@ -307,7 +300,7 @@ Both `forkserver` and `spawn` require importable module-level functions. Use mod
 
 `in_process(...)` does not propagate `contextvars` into workers. `in_thread(...)` can copy context into another thread in the same process, but `contextvars.Context` is not pickleable and cannot be sent to worker processes.
 
-Cancellation stops waiting for the process-pool result, but a task that is already running in a `ProcessPoolExecutor` cannot be cancelled individually. Use `concurrency`, `limit`, or the executor's worker count as the practical throttles.
+Cancellation stops waiting for the process-pool result, but a task that is already running in a `ProcessPoolExecutor` cannot be cancelled individually. Use `concurrency` and the executor's worker count as the practical throttles.
 
 ## Pipe operator syntax
 
