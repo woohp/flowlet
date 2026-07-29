@@ -38,5 +38,7 @@
 - For typed sourceless method-chaining, start with `Flow[T]()`; bare `Flow()` produces `Flow[Any, ...]` because there is no source to infer the input type from.
 - Concurrent stages emit values in completion order. Do not reintroduce ordered-output options unless explicitly requested.
 - `flowlet.functional` is the execution core; fluent `Pipeline`/`Flow` and `op` should wrap its curried operators rather than duplicating execution logic.
+- Concurrent `_map`/`_flat_map` deliberately hand the source to a feeder task and read results off a queue. Do not "simplify" this back to awaiting `anext(source)` inside the driver loop: that makes a stage withhold finished results while the source is slow, which stalls live sources. Racing the pull as a per-item task instead was measured 17-22x slower, because it can only pull one item per event-loop turn.
+- Worker and expansion tasks must publish every failure to the queue, `BaseException` included. The drivers count outstanding work rather than awaiting each task, so an exception left on a task object is silently dropped and the driver can hang.
 - `None` is valid data. Do not reintroduce sentinel-value stream termination.
 - When changing pipeline behavior, verify focused async tests first, then run the full test suite.

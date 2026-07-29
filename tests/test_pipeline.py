@@ -323,6 +323,94 @@ class TestConcurrency:
         assert sorted(result) == sorted(list(range(500)) * 6)
 
     @pytest.mark.asyncio
+    async def test_map_emits_while_the_source_is_blocked(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.Event().wait()
+
+        stream = pipe(source()).map(double, concurrency=2).__aiter__()
+        try:
+            # The result for item 1 is ready; a stage must not sit on it just
+            # because the source has not produced a second item yet.
+            assert await asyncio.wait_for(anext(stream), timeout=0.5) == 2
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_emits_while_the_source_is_blocked(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.Event().wait()
+
+        stream = pipe(source()).flat_map(lambda x: [x * 10], concurrency=2).__aiter__()
+        try:
+            assert await asyncio.wait_for(anext(stream), timeout=0.5) == 10
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_filter_emits_while_the_source_is_blocked(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.Event().wait()
+
+        stream = pipe(source()).filter(lambda x: True, concurrency=2).__aiter__()
+        try:
+            assert await asyncio.wait_for(anext(stream), timeout=0.5) == 1
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_map_emits_every_ready_result_while_the_source_is_blocked(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            for value in (1, 2, 3):
+                yield value
+            await asyncio.Event().wait()
+
+        stream = pipe(source()).map(double, concurrency=3).__aiter__()
+        collected: list[int] = []
+        try:
+            for _ in range(3):
+                collected.append(await asyncio.wait_for(anext(stream), timeout=0.5))
+        finally:
+            await cast(Any, stream).aclose()
+
+        assert sorted(collected) == [2, 4, 6]
+
+    @pytest.mark.asyncio
+    async def test_chained_concurrent_stages_do_not_stall_each_other(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            await asyncio.Event().wait()
+
+        stream = pipe(source()).map(double, concurrency=2).map(add_one, concurrency=2).__aiter__()
+        try:
+            assert await asyncio.wait_for(anext(stream), timeout=0.5) == 3
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_map_worker_cancelled_error_propagates(self) -> None:
+        # The driver counts outstanding work rather than awaiting each task, so a
+        # worker that fails must publish its failure or the driver would hang.
+        async def cancel(_: int) -> int:
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pipe([1, 2, 3]).map(cancel, concurrency=2).collect(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_map_worker_base_exception_propagates(self) -> None:
+        class StopNow(BaseException):
+            pass
+
+        async def stop(_: int) -> int:
+            raise StopNow
+
+        with pytest.raises(StopNow):
+            await asyncio.wait_for(pipe([1, 2, 3]).map(stop, concurrency=2).collect(), timeout=1)
+
+    @pytest.mark.asyncio
     async def test_invalid_concurrency_raises(self) -> None:
         with pytest.raises(ValueError, match="concurrency"):
             pipe([1]).map(double, concurrency=0)

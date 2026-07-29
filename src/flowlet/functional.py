@@ -22,15 +22,21 @@ class _Value[T]:
 
 @dataclass(frozen=True)
 class _Error:
-    error: Exception
+    error: BaseException
 
 
 @dataclass(frozen=True)
 class _Done:
-    token: int
+    """One expansion task terminated, successfully or not."""
 
 
-type _QueueItem[T] = _Value[T] | _Error | _Done
+@dataclass(frozen=True)
+class _Fed:
+    started: int
+
+
+type _MapItem[T] = _Value[T] | _Error | _Fed
+type _QueueItem[T] = _Value[T] | _Error | _Done | _Fed
 
 DEFAULT_BUFFER = 256
 """Default number of expanded values `flat_map` holds for a lagging consumer.
@@ -207,9 +213,14 @@ async def _map[T, U](
 ) -> AsyncIterator[U]:
     """Map a source lazily with bounded in-flight calls.
 
-    The sequential path avoids task scheduling overhead. The concurrent path
-    starts up to `concurrency` tasks and yields each result as soon as its task
-    completes, cancelling unfinished work if iteration stops or an error occurs.
+    The sequential path avoids task scheduling overhead. On the concurrent path a
+    single feeder task owns the source and starts one worker per item, while this
+    driver only ever reads finished results from a queue. Keeping the source off
+    the driver's await path is what lets a finished result be yielded while the
+    source is still blocked producing the next item.
+
+    A slot, returned once a value is yielded, bounds started-but-unyielded work at
+    `concurrency` and gives the stage backpressure.
     """
     if concurrency == 1:
         async for item in to_async_iter(source):
@@ -217,42 +228,61 @@ async def _map[T, U](
         return
 
     source_iter = to_async_iter(source)
-    pending: set[asyncio.Task[U]] = set()
-    remaining_done: set[asyncio.Task[U]] = set()
-    source_done = False
+    results: asyncio.Queue[_MapItem[U]] = asyncio.Queue()
+    slots = asyncio.Semaphore(concurrency)
+    workers: set[asyncio.Task[None]] = set()
 
-    async def start_next() -> None:
-        nonlocal source_done
-
-        if source_done:
-            return
-
+    async def run(item: T) -> None:
+        # Every exit publishes exactly one message, cancellation included, so the
+        # driver's count of outstanding work can never leave it stranded on `get`.
         try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
+            value = await _apply_map(fn, item)
+        except BaseException as exc:
+            results.put_nowait(_Error(exc))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+        else:
+            results.put_nowait(_Value(value))
 
-        pending.add(asyncio.create_task(_apply_map(fn, item)))
+    async def feed() -> None:
+        started = 0
+        try:
+            while True:
+                await slots.acquire()
+                try:
+                    item = await anext(source_iter)
+                except StopAsyncIteration:
+                    return
+                task = asyncio.create_task(run(item))
+                workers.add(task)
+                task.add_done_callback(workers.discard)
+                started += 1
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            results.put_nowait(_Error(exc))
+        finally:
+            # Reporting the count is what makes termination race-free: the driver
+            # never has to inspect a worker set that done callbacks mutate.
+            results.put_nowait(_Fed(started))
+
+    feeder = asyncio.create_task(feed())
+    started_total: int | None = None
+    yielded = 0
 
     try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            remaining_done = set(done)
-            for task in done:
-                remaining_done.remove(task)
-                yield await task
-
-            while len(pending) < concurrency and not source_done:
-                await start_next()
-    except BaseException:
-        await asyncio.gather(*remaining_done, return_exceptions=True)
-        raise
+        while started_total is None or yielded < started_total:
+            match await results.get():
+                case _Value(value):
+                    yielded += 1
+                    yield value
+                    slots.release()
+                case _Error(error):
+                    raise error
+                case _Fed(started):
+                    started_total = started
     finally:
-        await _cancel_tasks(pending)
+        await _cancel_tasks([feeder, *workers])
         await _close_async_iter(source_iter)
 
 
@@ -264,43 +294,50 @@ async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], i
 async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int, buffer: int) -> AsyncIterator[U]:
     """Flat-map a source with bounded concurrent expansions.
 
-    Each input gets an expansion task that streams values into a shared queue.
-    Queue messages distinguish yielded values, raised errors, and task
-    termination so downstream consumers can receive values as they arrive while
-    the driver still knows when to start more input work.
+    A feeder task owns the source and starts one expansion task per item, while
+    this driver only ever reads from the queue. Keeping the source off the
+    driver's await path is what lets a ready value be yielded while the source is
+    still blocked producing the next item.
 
-    Expansions must take a slot from `capacity` before queueing a value, and the
-    driver returns one after each value is yielded. That bounds unconsumed values
-    at `buffer`, so a slow consumer stalls production instead of letting
-    expansions buffer without limit.
+    Two semaphores do separate jobs. `slots`, returned when an expansion
+    terminates, bounds concurrent expansions. `capacity`, returned after a value
+    is yielded, bounds unconsumed values at `buffer` so a slow consumer stalls
+    production instead of letting expansions buffer without limit.
     """
     source_iter = to_async_iter(source)
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     capacity = asyncio.Semaphore(buffer)
-    pending: dict[int, asyncio.Task[None]] = {}
-    source_done = False
-    next_token = 0
+    slots = asyncio.Semaphore(concurrency)
+    expansions: set[asyncio.Task[None]] = set()
 
-    async def start_next() -> None:
-        nonlocal next_token, source_done
-
-        if source_done:
-            return
-
+    async def feed() -> None:
+        started = 0
         try:
-            item = await anext(source_iter)
-        except StopAsyncIteration:
-            source_done = True
-            return
+            while True:
+                await slots.acquire()
+                try:
+                    item = await anext(source_iter)
+                except StopAsyncIteration:
+                    return
+                task = asyncio.create_task(_emit_expansion(fn, item, queue, capacity))
+                expansions.add(task)
+                task.add_done_callback(expansions.discard)
+                started += 1
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            queue.put_nowait(_Error(exc))
+        finally:
+            # Reporting the count is what makes termination race-free: the driver
+            # counts `_Done` messages instead of inspecting a mutating task set.
+            queue.put_nowait(_Fed(started))
 
-        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token, capacity))
-        next_token += 1
+    feeder = asyncio.create_task(feed())
+    started_total: int | None = None
+    finished = 0
 
     try:
-        while len(pending) < concurrency and not source_done:
-            await start_next()
-
-        while pending:
+        while started_total is None or finished < started_total:
             match await queue.get():
                 case _Value(value):
                     yield value
@@ -309,13 +346,13 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                     capacity.release()
                 case _Error(error):
                     raise error
-                case _Done(token):
-                    task = pending.pop(token)
-                    await task
-                    while len(pending) < concurrency and not source_done:
-                        await start_next()
+                case _Done():
+                    finished += 1
+                    slots.release()
+                case _Fed(started):
+                    started_total = started
     finally:
-        await _cancel_tasks(pending.values())
+        await _cancel_tasks([feeder, *expansions])
         await _close_async_iter(source_iter)
 
 
@@ -323,7 +360,6 @@ async def _emit_expansion[T, U](
     fn: Expander[T, U],
     item: T,
     queue: asyncio.Queue[_QueueItem[U]],
-    token: int,
     capacity: asyncio.Semaphore,
 ) -> None:
     """Run one flat-map expansion and publish its values or error to `queue`.
@@ -332,6 +368,10 @@ async def _emit_expansion[T, U](
     of the consumer rather than buffering its whole output. A final `_Done`
     message is always sent so `_flat_map` can retire this expansion task even
     when the expansion raises.
+
+    Every failure is published, including `BaseException`, because the driver
+    counts `_Done` messages rather than awaiting each task; an exception left on
+    the task object would be silently dropped.
     """
     try:
         expanded = await _maybe_await(fn(item))
@@ -343,16 +383,16 @@ async def _emit_expansion[T, U](
             for value in cast(Iterable[U], expanded):
                 await capacity.acquire()
                 queue.put_nowait(_Value(value))
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
+    except BaseException as exc:
         queue.put_nowait(_Error(exc))
+        if isinstance(exc, asyncio.CancelledError):
+            raise
     finally:
         # _Done means the task terminated, not that it completed successfully.
         # The queue is intentionally unbounded so both terminal messages can be
         # sent without awaiting during cancellation cleanup; `capacity`, not the
         # queue size, is what bounds buffering.
-        queue.put_nowait(_Done(token))
+        queue.put_nowait(_Done())
 
 
 async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
