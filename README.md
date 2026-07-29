@@ -157,7 +157,13 @@ await pipe(events).map(write_to_log, concurrency=20).drain()
 | `.collect()` | Consume into a `list` | Consumer |
 | `.drain()` | Consume and discard output | Consumer |
 
-`flat_map(fn)` expects finite expansions. Outputs are buffered internally; very large expansions may consume significant memory.
+`flat_map(fn)` holds at most `buffer` expanded values (default 256) for a consumer that has not taken them yet. Once that buffer is full, expansions pause until the consumer catches up, so a large expansion streams rather than materializing in memory.
+
+```python
+# Wide expansions go faster with a larger buffer, at the cost of holding
+# more values in memory; a smaller buffer bounds memory more tightly.
+rows = pipe(files).flat_map(parse_rows, concurrency=8, buffer=2048)
+```
 
 With `flat_map(in_thread(fn))`, prefer returning a materialized collection such as `list` or `tuple`. If `fn` returns a lazy generator, the generator object is created in the worker thread but iterated later on the event-loop thread.
 

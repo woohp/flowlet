@@ -52,13 +52,17 @@ class Flow[T, U = T]:
         fn: Expander[U, V],
         *,
         concurrency: int = 1,
+        buffer: int = functional.DEFAULT_BUFFER,
     ) -> Flow[T, V]:
         """Return a flow that expands each item into zero or more outputs.
 
         `fn` may return an iterable, async iterable, or an awaitable resolving to
         either. Outputs from concurrent expansions are emitted as they arrive.
+
+        `buffer` caps how many expanded values may wait for the consumer before
+        expansions pause.
         """
-        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency))
+        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency, buffer=buffer))
 
     def filter(
         self,
@@ -139,13 +143,17 @@ class Pipeline[T]:
         fn: Expander[T, U],
         *,
         concurrency: int = 1,
+        buffer: int = functional.DEFAULT_BUFFER,
     ) -> Pipeline[U]:
         """Return a pipeline that expands each item into zero or more outputs.
 
         `fn` may return an iterable, async iterable, or an awaitable resolving to
         either. Outputs from concurrent expansions are emitted as they arrive.
+
+        `buffer` caps how many expanded values may wait for the consumer before
+        expansions pause.
         """
-        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency))
+        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency, buffer=buffer))
 
     def filter(
         self,

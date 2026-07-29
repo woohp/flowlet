@@ -23,9 +23,11 @@ def map[T, U](  # noqa: A001
     return Flow._from_operator(functional.map(fn, concurrency=concurrency))
 
 
-def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1) -> Flow[T, U]:
+def flat_map[T, U](
+    fn: Expander[T, U], *, concurrency: int = 1, buffer: int = functional.DEFAULT_BUFFER
+) -> Flow[T, U]:
     """Build a reusable one-step flow that expands each item."""
-    return Flow._from_operator(functional.flat_map(fn, concurrency=concurrency))
+    return Flow._from_operator(functional.flat_map(fn, concurrency=concurrency, buffer=buffer))
 
 
 def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Flow[T, T]:  # noqa: A001

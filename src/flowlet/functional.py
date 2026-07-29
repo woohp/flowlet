@@ -32,6 +32,14 @@ class _Done:
 
 type _QueueItem[T] = _Value[T] | _Error | _Done
 
+DEFAULT_BUFFER = 256
+"""Default number of expanded values `flat_map` holds for a lagging consumer.
+
+Bounding this is what gives the stage backpressure. Raising it trades memory for
+throughput on wide expansions, because every value produced past the bound needs
+an event-loop round trip to reclaim a slot; lowering it does the reverse.
+"""
+
 
 async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
     """Yield items from an iterable or async iterable as an async iterator."""
@@ -71,16 +79,22 @@ def map[T, U](  # noqa: A001
     return apply
 
 
-def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1) -> Operator[T, U]:
+def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, buffer: int = DEFAULT_BUFFER) -> Operator[T, U]:
     """Return an operator that expands each source item into zero or more outputs.
 
     `fn` may return an iterable, async iterable, or an awaitable resolving to
     either. Concurrent expansions yield values as they become available.
+
+    `buffer` caps how many expanded values may wait for the consumer. Once it is
+    full, expansions pause instead of buffering, so large expansions stream. Wide
+    expansions go faster with a larger `buffer` at the cost of holding more
+    values in memory.
     """
     _validate_concurrency(concurrency)
+    _validate_buffer(buffer)
 
     async def apply(source: Source[T]) -> AsyncIterator[U]:
-        async for value in _flat_map(source, fn, concurrency):
+        async for value in _flat_map(source, fn, concurrency, buffer):
             yield value
 
     return apply
@@ -182,6 +196,12 @@ def _validate_concurrency(concurrency: int) -> None:
         raise ValueError("concurrency must be >= 1")
 
 
+def _validate_buffer(buffer: int) -> None:
+    """Reject an unusable value buffer before an operator is built."""
+    if buffer < 1:
+        raise ValueError("buffer must be >= 1")
+
+
 async def _map[T, U](
     source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
 ) -> AsyncIterator[U]:
@@ -241,16 +261,22 @@ async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], i
     return await _maybe_await(fn(item))
 
 
-async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int) -> AsyncIterator[U]:
+async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int, buffer: int) -> AsyncIterator[U]:
     """Flat-map a source with bounded concurrent expansions.
 
     Each input gets an expansion task that streams values into a shared queue.
     Queue messages distinguish yielded values, raised errors, and task
     termination so downstream consumers can receive values as they arrive while
     the driver still knows when to start more input work.
+
+    Expansions must take a slot from `capacity` before queueing a value, and the
+    driver returns one after each value is yielded. That bounds unconsumed values
+    at `buffer`, so a slow consumer stalls production instead of letting
+    expansions buffer without limit.
     """
     source_iter = to_async_iter(source)
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
+    capacity = asyncio.Semaphore(buffer)
     pending: dict[int, asyncio.Task[None]] = {}
     source_done = False
     next_token = 0
@@ -267,7 +293,7 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
             source_done = True
             return
 
-        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token))
+        pending[next_token] = asyncio.create_task(_emit_expansion(fn, item, queue, next_token, capacity))
         next_token += 1
 
     try:
@@ -278,6 +304,9 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
             match await queue.get():
                 case _Value(value):
                     yield value
+                    # Returned only after the consumer takes the value, so a
+                    # slow consumer holds the slot and throttles production.
+                    capacity.release()
                 case _Error(error):
                     raise error
                 case _Done(token):
@@ -290,28 +319,39 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
         await _close_async_iter(source_iter)
 
 
-async def _emit_expansion[T, U](fn: Expander[T, U], item: T, queue: asyncio.Queue[_QueueItem[U]], token: int) -> None:
+async def _emit_expansion[T, U](
+    fn: Expander[T, U],
+    item: T,
+    queue: asyncio.Queue[_QueueItem[U]],
+    token: int,
+    capacity: asyncio.Semaphore,
+) -> None:
     """Run one flat-map expansion and publish its values or error to `queue`.
 
-    A final `_Done` message is always sent so `_flat_map` can retire this
-    expansion task even when the expansion raises.
+    Each value costs a capacity slot, so an expansion blocks once it runs ahead
+    of the consumer rather than buffering its whole output. A final `_Done`
+    message is always sent so `_flat_map` can retire this expansion task even
+    when the expansion raises.
     """
     try:
         expanded = await _maybe_await(fn(item))
         if isinstance(expanded, AsyncIterable):
             async for value in expanded:
-                await queue.put(_Value(value))
+                await capacity.acquire()
+                queue.put_nowait(_Value(value))
         else:
             for value in cast(Iterable[U], expanded):
-                await queue.put(_Value(value))
+                await capacity.acquire()
+                queue.put_nowait(_Value(value))
     except asyncio.CancelledError:
         raise
     except Exception as exc:
         queue.put_nowait(_Error(exc))
     finally:
         # _Done means the task terminated, not that it completed successfully.
-        # The flat_map queue is intentionally unbounded so termination can be
-        # signaled without awaiting during cancellation cleanup.
+        # The queue is intentionally unbounded so both terminal messages can be
+        # sent without awaiting during cancellation cleanup; `capacity`, not the
+        # queue size, is what bounds buffering.
         queue.put_nowait(_Done(token))
 
 

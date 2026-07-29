@@ -213,6 +213,116 @@ class TestConcurrency:
         assert sorted(result) == [20, 30, 40]
 
     @pytest.mark.asyncio
+    async def test_flat_map_applies_backpressure_to_a_slow_consumer(self) -> None:
+        produced = 0
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            nonlocal produced
+            for i in range(10_000):
+                produced += 1
+                yield i
+                await asyncio.sleep(0)
+
+        stream = pipe([1, 2]).flat_map(expand, concurrency=2, buffer=32).__aiter__()
+        try:
+            await anext(stream)
+            # The consumer stalls holding one value; expansions must park once
+            # they fill the buffer rather than draining their whole output.
+            await asyncio.sleep(0.05)
+
+            assert produced <= 48, f"ran {produced} values ahead of a stalled consumer"
+        finally:
+            await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_flat_map_stays_bounded_across_sustained_slow_consumption(self) -> None:
+        produced = 0
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            nonlocal produced
+            for i in range(10_000):
+                produced += 1
+                yield i
+                await asyncio.sleep(0)
+
+        consumed = 0
+        async for _ in pipe(range(10)).flat_map(expand, concurrency=4, buffer=32):
+            consumed += 1
+            await asyncio.sleep(0)
+            if consumed == 20:
+                break
+
+        assert produced <= consumed + 48, f"produced {produced} for {consumed} consumed"
+
+    @pytest.mark.asyncio
+    async def test_flat_map_buffer_smaller_than_concurrency_still_completes(self) -> None:
+        async def expand(x: int) -> AsyncIterator[int]:
+            for i in range(20):
+                yield i
+                await asyncio.sleep(0)
+
+        result = await asyncio.wait_for(
+            pipe(range(8)).flat_map(expand, concurrency=8, buffer=1).collect(), timeout=5
+        )
+
+        assert sorted(result) == sorted(list(range(20)) * 8)
+
+    @pytest.mark.asyncio
+    async def test_flat_map_larger_buffer_allows_more_runahead(self) -> None:
+        async def counting_expansion(counter: list[int]) -> Any:
+            async def expand(x: int) -> AsyncIterator[int]:
+                for i in range(10_000):
+                    counter[0] += 1
+                    yield i
+                    await asyncio.sleep(0)
+
+            return expand
+
+        async def runahead(buffer: int) -> int:
+            counter = [0]
+            expand = await counting_expansion(counter)
+            stream = pipe([1]).flat_map(expand, concurrency=1, buffer=buffer).__aiter__()
+            try:
+                await anext(stream)
+                await asyncio.sleep(0.02)
+                return counter[0]
+            finally:
+                await cast(Any, stream).aclose()
+
+        assert await runahead(4) < await runahead(512)
+
+    @pytest.mark.asyncio
+    async def test_invalid_buffer_raises(self) -> None:
+        with pytest.raises(ValueError, match="buffer"):
+            pipe([1]).flat_map(lambda x: [x], buffer=0)
+
+    @pytest.mark.asyncio
+    async def test_flat_map_abandoned_mid_expansion_does_not_hang(self) -> None:
+        async def expand(x: int) -> AsyncIterator[int]:
+            for i in range(10_000):
+                yield i
+
+        # Expansions are parked waiting for capacity when the consumer leaves;
+        # cancelling them must not deadlock on the backpressure credit.
+        async def run() -> None:
+            async for _ in pipe(range(20)).flat_map(expand, concurrency=4):
+                break
+
+        await asyncio.wait_for(run(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_flat_map_emits_every_value_of_a_large_expansion(self) -> None:
+        async def expand(x: int) -> AsyncIterator[int]:
+            for i in range(500):
+                yield i
+                await asyncio.sleep(0)
+
+        result = await asyncio.wait_for(pipe(range(6)).flat_map(expand, concurrency=3).collect(), timeout=5)
+
+        assert len(result) == 3000
+        assert sorted(result) == sorted(list(range(500)) * 6)
+
+    @pytest.mark.asyncio
     async def test_invalid_concurrency_raises(self) -> None:
         with pytest.raises(ValueError, match="concurrency"):
             pipe([1]).map(double, concurrency=0)
