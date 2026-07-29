@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import Any, Protocol, cast, overload
 
@@ -48,14 +48,70 @@ an event-loop round trip to reclaim a slot; lowering it does the reverse.
 
 
 async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
-    """Yield items from an iterable or async iterable as an async iterator."""
+    """Yield items from an iterable or async iterable as an async iterator.
+
+    Closing this iterator also closes the wrapped source. Without that, closing
+    the wrapper would release nothing and the source's own cleanup would wait for
+    garbage collection.
+    """
     if isinstance(source, AsyncIterable):
-        async for item in source:
-            yield item
+        async_iterator = aiter(source)
+        surface = True
+        try:
+            async for item in async_iterator:
+                yield item
+        except GeneratorExit:
+            raise
+        except BaseException:
+            surface = False
+            raise
+        finally:
+            await _close_async_iter(async_iterator, surface=surface)
         return
 
-    for item in source:
-        yield item
+    sync_iterator = iter(source)
+    surface = True
+    try:
+        for item in sync_iterator:
+            yield item
+    except GeneratorExit:
+        raise
+    except BaseException:
+        surface = False
+        raise
+    finally:
+        _close_sync_iter(sync_iterator, surface=surface)
+
+
+async def _iterate_source[T](source: Source[T], cleanup: list[BaseException]) -> AsyncIterator[T]:
+    """Iterate `source` for a queue-based driver, recording any close failure.
+
+    The concurrent drivers read the source from a feeder task, whose exceptions
+    only reach the consumer through a queue the consumer may already have stopped
+    reading. Recording instead of raising keeps the failure available to teardown,
+    and stops it replacing a read failure on the way out.
+    """
+    if isinstance(source, AsyncIterable):
+        async_iterator = aiter(source)
+        try:
+            async for item in async_iterator:
+                yield item
+        finally:
+            try:
+                await _close_async_iter(async_iterator)
+            except BaseException as exc:
+                cleanup.append(exc)
+        return
+
+    sync_iterator = iter(source)
+    try:
+        for item in sync_iterator:
+            yield item
+    finally:
+        try:
+            _close_sync_iter(sync_iterator)
+        except BaseException as exc:
+            cleanup.append(exc)
 
 
 @overload
@@ -78,9 +134,12 @@ def map[T, U](  # noqa: A001
     """
     _validate_concurrency(concurrency)
 
-    async def apply(source: Source[T]) -> AsyncIterator[U]:
-        async for value in _map(source, fn, concurrency):
-            yield value
+    def apply(source: Source[T]) -> AsyncIterator[U]:
+        # Return the driver itself rather than re-yielding from it. `async for`
+        # does not close its iterator when GeneratorExit passes through, so a
+        # wrapper here would swallow the close and leave the driver's cleanup --
+        # cancelling tasks, closing the source -- to garbage collection.
+        return _map(source, fn, concurrency)
 
     return apply
 
@@ -99,9 +158,9 @@ def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, buffer: int = DE
     _validate_concurrency(concurrency)
     _validate_buffer(buffer)
 
-    async def apply(source: Source[T]) -> AsyncIterator[U]:
-        async for value in _flat_map(source, fn, concurrency, buffer):
-            yield value
+    def apply(source: Source[T]) -> AsyncIterator[U]:
+        # Returned directly, not re-yielded from: see the note in `map`.
+        return _flat_map(source, fn, concurrency, buffer)
 
     return apply
 
@@ -129,14 +188,25 @@ def batch[T](size: int) -> Operator[T, list[T]]:
         raise ValueError("size must be >= 1")
 
     async def apply(source: Source[T]) -> AsyncIterator[list[T]]:
+        source_iter = to_async_iter(source)
         chunk: list[T] = []
-        async for item in to_async_iter(source):
-            chunk.append(item)
-            if len(chunk) == size:
+        surface = True
+        try:
+            async for item in source_iter:
+                chunk.append(item)
+                if len(chunk) == size:
+                    yield chunk
+                    chunk = []
+            if chunk:
                 yield chunk
-                chunk = []
-        if chunk:
-            yield chunk
+        except GeneratorExit:
+            # A plain close: a cleanup failure is the only thing left to report.
+            raise
+        except BaseException:
+            surface = False
+            raise
+        finally:
+            await _teardown(source_iter, surface=surface)
 
     return apply
 
@@ -223,11 +293,23 @@ async def _map[T, U](
     `concurrency` and gives the stage backpressure.
     """
     if concurrency == 1:
-        async for item in to_async_iter(source):
-            yield await _apply_map(fn, item)
+        sequential_iter = to_async_iter(source)
+        surface = True
+        try:
+            async for item in sequential_iter:
+                yield await _apply_map(fn, item)
+        except GeneratorExit:
+            # A plain close: a cleanup failure is the only thing left to report.
+            raise
+        except BaseException:
+            surface = False
+            raise
+        finally:
+            await _teardown(sequential_iter, surface=surface)
         return
 
-    source_iter = to_async_iter(source)
+    cleanup: list[BaseException] = []
+    source_iter = _iterate_source(source, cleanup)
     results: asyncio.Queue[_MapItem[U]] = asyncio.Queue()
     slots = asyncio.Semaphore(concurrency)
     workers: set[asyncio.Task[None]] = set()
@@ -239,7 +321,7 @@ async def _map[T, U](
             value = await _apply_map(fn, item)
         except BaseException as exc:
             results.put_nowait(_Error(exc))
-            if isinstance(exc, asyncio.CancelledError):
+            if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         else:
             results.put_nowait(_Value(value))
@@ -257,10 +339,14 @@ async def _map[T, U](
                 workers.add(task)
                 task.add_done_callback(workers.discard)
                 started += 1
-        except asyncio.CancelledError:
-            raise
         except BaseException as exc:
+            # Published even when cancelled: a source that raises CancelledError
+            # must surface, not look like a short stream. When the cancellation is
+            # this driver tearing the feeder down, it has already stopped reading
+            # and the message is discarded.
             results.put_nowait(_Error(exc))
+            if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
+                raise
         finally:
             # Reporting the count is what makes termination race-free: the driver
             # never has to inspect a worker set that done callbacks mutate.
@@ -269,6 +355,7 @@ async def _map[T, U](
     feeder = asyncio.create_task(feed())
     started_total: int | None = None
     yielded = 0
+    surface = True
 
     try:
         while started_total is None or yielded < started_total:
@@ -281,9 +368,14 @@ async def _map[T, U](
                     raise error
                 case _Fed(started):
                     started_total = started
+    except GeneratorExit:
+        # A plain close: a cleanup failure is the only thing left to report.
+        raise
+    except BaseException:
+        surface = False
+        raise
     finally:
-        await _cancel_tasks([feeder, *workers])
-        await _close_async_iter(source_iter)
+        await _teardown(source_iter, [feeder, *workers], surface=surface, cleanup=cleanup)
 
 
 async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
@@ -304,7 +396,8 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
     is yielded, bounds unconsumed values at `buffer` so a slow consumer stalls
     production instead of letting expansions buffer without limit.
     """
-    source_iter = to_async_iter(source)
+    cleanup: list[BaseException] = []
+    source_iter = _iterate_source(source, cleanup)
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     capacity = asyncio.Semaphore(buffer)
     slots = asyncio.Semaphore(concurrency)
@@ -319,14 +412,15 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                     item = await anext(source_iter)
                 except StopAsyncIteration:
                     return
-                task = asyncio.create_task(_emit_expansion(fn, item, queue, capacity))
+                task = asyncio.create_task(_emit_expansion(fn, item, queue, capacity, cleanup))
                 expansions.add(task)
                 task.add_done_callback(expansions.discard)
                 started += 1
-        except asyncio.CancelledError:
-            raise
         except BaseException as exc:
+            # Published even when cancelled; see the note in `_map`'s feeder.
             queue.put_nowait(_Error(exc))
+            if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
+                raise
         finally:
             # Reporting the count is what makes termination race-free: the driver
             # counts `_Done` messages instead of inspecting a mutating task set.
@@ -335,6 +429,7 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
     feeder = asyncio.create_task(feed())
     started_total: int | None = None
     finished = 0
+    surface = True
 
     try:
         while started_total is None or finished < started_total:
@@ -351,9 +446,14 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                     slots.release()
                 case _Fed(started):
                     started_total = started
+    except GeneratorExit:
+        # A plain close: a cleanup failure is the only thing left to report.
+        raise
+    except BaseException:
+        surface = False
+        raise
     finally:
-        await _cancel_tasks([feeder, *expansions])
-        await _close_async_iter(source_iter)
+        await _teardown(source_iter, [feeder, *expansions], surface=surface, cleanup=cleanup)
 
 
 async def _emit_expansion[T, U](
@@ -361,6 +461,7 @@ async def _emit_expansion[T, U](
     item: T,
     queue: asyncio.Queue[_QueueItem[U]],
     capacity: asyncio.Semaphore,
+    cleanup: list[BaseException],
 ) -> None:
     """Run one flat-map expansion and publish its values or error to `queue`.
 
@@ -369,6 +470,11 @@ async def _emit_expansion[T, U](
     message is always sent so `_flat_map` can retire this expansion task even
     when the expansion raises.
 
+    This owns the expanded iterator's lifetime and closes it on every exit. A
+    bare `async for`/`for` would leave a custom iterator's `aclose`/`close`
+    uncalled, so an expansion holding a cursor or response body would not be
+    released when the pipeline stops early.
+
     Every failure is published, including `BaseException`, because the driver
     counts `_Done` messages rather than awaiting each task; an exception left on
     the task object would be silently dropped.
@@ -376,16 +482,38 @@ async def _emit_expansion[T, U](
     try:
         expanded = await _maybe_await(fn(item))
         if isinstance(expanded, AsyncIterable):
-            async for value in expanded:
-                await capacity.acquire()
-                queue.put_nowait(_Value(value))
+            async_values = aiter(expanded)
+            surface = True
+            try:
+                async for value in async_values:
+                    await capacity.acquire()
+                    queue.put_nowait(_Value(value))
+            except BaseException:
+                surface = False
+                raise
+            finally:
+                try:
+                    await _close_async_iter(async_values)
+                except BaseException as close_error:
+                    _report_cleanup(close_error, queue, cleanup, surface=surface)
         else:
-            for value in cast(Iterable[U], expanded):
-                await capacity.acquire()
-                queue.put_nowait(_Value(value))
+            sync_values = iter(cast(Iterable[U], expanded))
+            surface = True
+            try:
+                for value in sync_values:
+                    await capacity.acquire()
+                    queue.put_nowait(_Value(value))
+            except BaseException:
+                surface = False
+                raise
+            finally:
+                try:
+                    _close_sync_iter(sync_values)
+                except BaseException as close_error:
+                    _report_cleanup(close_error, queue, cleanup, surface=surface)
     except BaseException as exc:
         queue.put_nowait(_Error(exc))
-        if isinstance(exc, asyncio.CancelledError):
+        if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
             raise
     finally:
         # _Done means the task terminated, not that it completed successfully.
@@ -395,24 +523,125 @@ async def _emit_expansion[T, U](
         queue.put_nowait(_Done())
 
 
+async def _teardown(
+    source: AsyncIterator[Any],
+    tasks: Iterable[asyncio.Task[Any]] = (),
+    *,
+    surface: bool,
+    cleanup: Iterable[BaseException] = (),
+) -> None:
+    """Cancel `tasks` and close `source`, always attempting both.
+
+    A cleanup failure is re-raised only when `surface` is true. Both directions
+    matter: reporting success from `aclose` while a resource was left unreleased
+    hides a real problem, but a cleanup failure must never replace the error that
+    caused the teardown, which is the more useful of the two. Only the first
+    cleanup failure is reported.
+    """
+    failure: BaseException | None = None
+    try:
+        await _cancel_tasks(tasks)
+    except BaseException as exc:
+        failure = exc
+
+    try:
+        await _close_async_iter(source)
+    except BaseException as exc:
+        if failure is None:
+            failure = exc
+
+    for recorded in cleanup:
+        if failure is None:
+            failure = recorded
+
+    if failure is not None and surface:
+        raise failure
+
+
+def _report_cleanup[U](
+    error: BaseException,
+    queue: asyncio.Queue[_QueueItem[U]],
+    cleanup: list[BaseException],
+    *,
+    surface: bool,
+) -> None:
+    """Handle an owned iterator's close failure.
+
+    Always recorded, so teardown can report it if the consumer abandons the
+    pipeline before it is delivered. Also queued when nothing else is already on
+    its way out, so a consumer that is still reading fails fast instead of
+    running on against a source that may never end. When an iteration error or a
+    cancellation is already propagating, that one is the useful exception and the
+    close failure is only recorded.
+    """
+    cleanup.append(error)
+    if surface and not _is_cancelling():
+        queue.put_nowait(_Error(error))
+
+
+def _is_cancelling() -> bool:
+    """Whether the running task has a pending cancellation request.
+
+    Producers use this to tell "my own cleanup failed while I was being torn
+    down" from "the thing I was reading raised". In the first case publishing to
+    the queue is not enough, because the driver has already stopped reading.
+    """
+    task = asyncio.current_task()
+    return task is not None and bool(task.cancelling())
+
+
 async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
-    """Cancel tasks and wait for cancellation cleanup to finish."""
+    """Cancel tasks, wait for their cleanup, and surface any cleanup failure.
+
+    Cancellation itself is expected and ignored. Anything else means a task's
+    cleanup failed, which must not be swallowed: reporting success from `aclose`
+    while a resource was left unreleased is worse than the failure. Only the
+    first failure is raised; a second concurrent cleanup failure is dropped.
+    """
     task_list = list(tasks)
     for task in task_list:
         task.cancel()
-    if task_list:
-        await asyncio.gather(*task_list, return_exceptions=True)
+    if not task_list:
+        return
+
+    outcomes = await asyncio.gather(*task_list, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(outcome, asyncio.CancelledError):
+            raise outcome
 
 
-async def _close_async_iter(source: AsyncIterator[Any]) -> None:
+def _close_sync_iter(iterator: Iterator[Any], *, surface: bool = True) -> None:
+    """Close a synchronous iterator when it exposes `close`.
+
+    Abandoning a generator relies on the cyclic collector to close it, because a
+    live traceback keeps its frame reachable; closing here makes it deterministic.
+    A close failure is re-raised only when `surface` is true, so a caller already
+    propagating an error keeps it.
+    """
+    close = getattr(iterator, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except BaseException:
+        if surface:
+            raise
+
+
+async def _close_async_iter(source: AsyncIterator[Any], *, surface: bool = True) -> None:
     """Close an async iterator when it exposes `aclose`.
 
     This lets pipeline stages release upstream generators promptly when a
     downstream consumer stops early or an error interrupts iteration.
     """
     aclose = getattr(source, "aclose", None)
-    if aclose is not None:
+    if aclose is None:
+        return
+    try:
         await aclose()
+    except BaseException:
+        if surface:
+            raise
 
 
 async def _maybe_await[T](value: T | Awaitable[T]) -> T:

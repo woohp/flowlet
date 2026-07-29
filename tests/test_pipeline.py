@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import gc
 import multiprocessing as mp
 import threading
 import time
@@ -35,6 +36,21 @@ def process_is_even(x: int) -> bool:
 
 def process_expand(x: int) -> list[int]:
     return [x, x * 10]
+
+
+@pytest.fixture
+def no_cyclic_gc() -> Generator[None]:
+    """Stop a cyclic collection from standing in for explicit cleanup.
+
+    An abandoned generator is kept reachable by the live traceback, so only the
+    cyclic collector closes it. If it ran mid-test it would close the generator
+    on its own and let an implementation that never closes anything pass.
+    """
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
 
 
 class TestPipelineApi:
@@ -703,6 +719,428 @@ class TestSourcesAndTerminals:
             break
 
         await asyncio.wait_for(cancelled.wait(), timeout=0.1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 3])
+    async def test_close_releases_the_upstream_source(self, concurrency: int, no_cyclic_gc: None) -> None:
+        closed = False
+
+        async def source() -> AsyncIterator[int]:
+            nonlocal closed
+            try:
+                for value in range(100):
+                    yield value
+            finally:
+                closed = True
+
+        stream = pipe(source()).map(double, concurrency=concurrency).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        # Read with no sleep and no gc.collect(): cleanup has to be driven by
+        # aclose itself, not by garbage collection catching up later.
+        assert closed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda s: pipe(s).flat_map(lambda x: [x], concurrency=3), id="flat_map"),
+            pytest.param(lambda s: pipe(s).filter(lambda x: True, concurrency=3), id="filter"),
+            pytest.param(lambda s: pipe(s).batch(2), id="batch"),
+            pytest.param(lambda s: pipe(s), id="no_operators"),
+            pytest.param(
+                lambda s: pipe(s).map(to_str).flat_map(lambda x: [x], concurrency=3).batch(2),
+                id="three_stages",
+            ),
+        ],
+    )
+    async def test_close_releases_the_upstream_source_for_every_operator(
+        self, build: Any, no_cyclic_gc: None
+    ) -> None:
+        closed = False
+
+        async def source() -> AsyncIterator[int]:
+            nonlocal closed
+            try:
+                for value in range(100):
+                    yield value
+            finally:
+                closed = True
+
+        stream = build(source()).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        assert closed
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_in_flight_work_before_returning(self) -> None:
+        running: set[int] = set()
+
+        async def work(x: int) -> int:
+            if x == 0:
+                return x
+            running.add(x)
+            try:
+                await asyncio.Event().wait()
+            finally:
+                running.discard(x)
+            return x
+
+        stream = pipe(range(20)).map(work, concurrency=4).__aiter__()
+        assert await anext(stream) == 0
+        for _ in range(200):
+            await asyncio.sleep(0)
+            if len(running) >= 3:
+                break
+        assert running
+
+        await cast(Any, stream).aclose()
+
+        assert not running, "aclose returned while workers were still running"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 2])
+    async def test_source_cancelled_error_is_not_silent_truncation(self, concurrency: int) -> None:
+        # A source raising CancelledError must surface rather than look like a
+        # short stream, or callers silently accept partial data.
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pipe(source()).map(double, concurrency=concurrency).collect(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 2])
+    async def test_flat_map_source_cancelled_error_is_not_silent_truncation(self, concurrency: int) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(
+                pipe(source()).flat_map(lambda x: [x], concurrency=concurrency).collect(), timeout=1
+            )
+
+    @pytest.mark.asyncio
+    async def test_close_releases_a_custom_async_expansion_iterator(self) -> None:
+        closed = False
+
+        class Cursor:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __aiter__(self) -> "Cursor":
+                return self
+
+            async def __anext__(self) -> int:
+                self.emitted += 1
+                if self.emitted > 10_000:
+                    raise StopAsyncIteration
+                return self.emitted
+
+            async def aclose(self) -> None:
+                nonlocal closed
+                closed = True
+
+        stream = pipe([1]).flat_map(lambda x: Cursor(), concurrency=1, buffer=2).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        # A bare `async for` never calls aclose, so only an async *generator*
+        # would get cleaned up here, and only via garbage collection.
+        assert closed
+
+    @pytest.mark.asyncio
+    async def test_close_releases_a_custom_sync_expansion_iterator(self) -> None:
+        closed = False
+
+        class Rows:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __iter__(self) -> "Rows":
+                return self
+
+            def __next__(self) -> int:
+                self.emitted += 1
+                if self.emitted > 10_000:
+                    raise StopIteration
+                return self.emitted
+
+            def close(self) -> None:
+                nonlocal closed
+                closed = True
+
+        stream = pipe([1]).flat_map(lambda x: Rows(), concurrency=1, buffer=2).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        # Nothing but explicit ownership calls close() on a custom iterator, so
+        # unlike the generator cases this holds no matter what the collector does.
+        assert closed
+
+    @pytest.mark.asyncio
+    async def test_close_releases_a_sync_generator_expansion(self, no_cyclic_gc: None) -> None:
+        closed = False
+
+        def rows(_: int) -> Generator[int]:
+            nonlocal closed
+            try:
+                yield from range(10_000)
+            finally:
+                closed = True
+
+        stream = pipe([1]).flat_map(rows, concurrency=1, buffer=2).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        assert closed
+
+    @pytest.mark.asyncio
+    async def test_close_releases_an_async_generator_expansion(self, no_cyclic_gc: None) -> None:
+        closed = False
+
+        async def rows(_: int) -> AsyncIterator[int]:
+            nonlocal closed
+            try:
+                for value in range(10_000):
+                    yield value
+            finally:
+                closed = True
+
+        stream = pipe([1]).flat_map(rows, concurrency=1, buffer=2).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        assert closed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda s: pipe(s), id="no_operators"),
+            pytest.param(lambda s: pipe(s).map(double, concurrency=1), id="map_c1"),
+            pytest.param(lambda s: pipe(s).map(double, concurrency=2), id="map_c2"),
+            pytest.param(lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2), id="flat_map_c2"),
+            pytest.param(lambda s: pipe(s).batch(2), id="batch"),
+        ],
+    )
+    async def test_close_releases_a_custom_sync_source(self, build: Any) -> None:
+        closed = False
+
+        class Source:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __iter__(self) -> "Source":
+                return self
+
+            def __next__(self) -> int:
+                self.emitted += 1
+                if self.emitted > 10_000:
+                    raise StopIteration
+                return self.emitted
+
+            def close(self) -> None:
+                nonlocal closed
+                closed = True
+
+        stream = build(Source()).__aiter__()
+        await anext(stream)
+        await cast(Any, stream).aclose()
+
+        # close() on a plain object is never called by the collector, so this
+        # constrains explicit ownership regardless of gc.
+        assert closed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 2, 4])
+    async def test_source_cleanup_failure_is_reported_by_close(self, concurrency: int) -> None:
+        async def source() -> AsyncIterator[int]:
+            try:
+                yield 1
+                await asyncio.Event().wait()
+            finally:
+                raise ValueError("cleanup boom")
+
+        # Parked in anext() when cancelled, which is where the failure used to be
+        # published to a queue the driver had already stopped reading.
+        stream = pipe(source()).map(double, concurrency=concurrency).__aiter__()
+        await anext(stream)
+        await asyncio.sleep(0.02)
+
+        with pytest.raises(ValueError, match="cleanup boom"):
+            await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 2])
+    async def test_expansion_cleanup_failure_is_reported_by_close(self, concurrency: int) -> None:
+        class Cursor:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __aiter__(self) -> "Cursor":
+                return self
+
+            async def __anext__(self) -> int:
+                self.emitted += 1
+                if self.emitted > 10_000:
+                    raise StopAsyncIteration
+                return self.emitted
+
+            async def aclose(self) -> None:
+                raise ValueError("expansion cleanup boom")
+
+        stream = pipe([1]).flat_map(lambda x: Cursor(), concurrency=concurrency, buffer=2).__aiter__()
+        await anext(stream)
+
+        with pytest.raises(ValueError, match="expansion cleanup boom"):
+            await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("concurrency", [1, 2, 4])
+    async def test_cleanup_failure_does_not_mask_the_pipeline_error(self, concurrency: int) -> None:
+        async def source() -> AsyncIterator[int]:
+            try:
+                for value in range(100):
+                    yield value
+            finally:
+                raise ValueError("cleanup boom")
+
+        async def boom(_: int) -> int:
+            raise RuntimeError("pipeline boom")
+
+        # The pipeline error is the useful one; a teardown failure must not
+        # replace it, or the root cause disappears.
+        with pytest.raises(RuntimeError, match="pipeline boom"):
+            await asyncio.wait_for(
+                pipe(source()).map(boom, concurrency=concurrency).collect(), timeout=1
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
+            # Only the concurrent drivers read ahead, so only they can exhaust the
+            # source before the consumer abandons. The sequential paths are lazy and
+            # are covered by test_source_cleanup_failure_is_reported_by_close.
+            pytest.param(lambda s: pipe(s).map(double, concurrency=2), id="map_c2"),
+            pytest.param(lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2), id="flat_map_c2"),
+        ],
+    )
+    async def test_cleanup_failure_on_natural_exhaustion_is_reported(self, build: Any) -> None:
+        cleanup_ran = asyncio.Event()
+
+        class ExhaustOnSecondRead:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __aiter__(self) -> "ExhaustOnSecondRead":
+                return self
+
+            async def __anext__(self) -> int:
+                self.emitted += 1
+                if self.emitted == 1:
+                    return 1
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                cleanup_ran.set()
+                raise ValueError("cleanup boom")
+
+        stream = build(ExhaustOnSecondRead()).__aiter__()
+        await anext(stream)
+        # The consumer holds a value, so the driver is parked at its yield.
+        # Waiting on the event pins the state without depending on sleep timing.
+        await asyncio.wait_for(cleanup_ran.wait(), timeout=1)
+
+        # No cancellation was pending when cleanup failed, so the failure has to
+        # be retained rather than left in a queue nobody reads.
+        with pytest.raises(ValueError, match="cleanup boom"):
+            await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda s: pipe(s), id="no_operators"),
+            pytest.param(lambda s: pipe(s).map(double, concurrency=1), id="map_c1"),
+            pytest.param(lambda s: pipe(s).map(double, concurrency=2), id="map_c2"),
+            pytest.param(lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2), id="flat_map_c2"),
+        ],
+    )
+    async def test_source_close_failure_does_not_mask_a_read_failure(self, build: Any) -> None:
+        class ReadThenCloseBoth:
+            def __aiter__(self) -> "ReadThenCloseBoth":
+                return self
+
+            async def __anext__(self) -> int:
+                raise RuntimeError("read boom")
+
+            async def aclose(self) -> None:
+                raise ValueError("cleanup boom")
+
+        with pytest.raises(RuntimeError, match="read boom"):
+            await asyncio.wait_for(build(ReadThenCloseBoth()).collect(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_expansion_cleanup_failure_stops_a_live_pipeline(self) -> None:
+        class OneThenBadClose:
+            def __init__(self) -> None:
+                self.emitted = 0
+
+            def __aiter__(self) -> "OneThenBadClose":
+                return self
+
+            async def __anext__(self) -> int:
+                self.emitted += 1
+                if self.emitted > 1:
+                    raise StopAsyncIteration
+                return self.emitted
+
+            async def aclose(self) -> None:
+                raise ValueError("cleanup boom")
+
+        async def live() -> AsyncIterator[int]:
+            value = 0
+            while True:
+                value += 1
+                yield value
+                await asyncio.sleep(0)
+
+        # The source never ends, so recording the failure for teardown is not
+        # enough: a consumer that is still reading has to be told.
+        collected: list[int] = []
+        with pytest.raises(ValueError, match="cleanup boom"):
+            async for item in pipe(live()).flat_map(
+                lambda x: OneThenBadClose(), concurrency=1, buffer=4
+            ):
+                collected.append(item)
+                if len(collected) > 20:
+                    break
+
+        assert len(collected) <= 2, f"kept running for {len(collected)} values after cleanup failed"
+
+    @pytest.mark.asyncio
+    async def test_expansion_close_failure_does_not_mask_a_read_failure(self) -> None:
+        class ReadThenCloseBoth:
+            def __aiter__(self) -> "ReadThenCloseBoth":
+                return self
+
+            async def __anext__(self) -> int:
+                raise RuntimeError("read boom")
+
+            async def aclose(self) -> None:
+                raise ValueError("cleanup boom")
+
+        with pytest.raises(RuntimeError, match="read boom"):
+            await asyncio.wait_for(
+                pipe([1]).flat_map(lambda x: ReadThenCloseBoth(), concurrency=1, buffer=4).collect(),
+                timeout=1,
+            )
 
     @pytest.mark.asyncio
     async def test_drain_drains_pipeline(self) -> None:
