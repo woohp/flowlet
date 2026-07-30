@@ -1,6 +1,6 @@
 [project]
 name = "flowlet"
-version = "0.3.0"
+version = "0.3.1"
 description = "A minimal async pipeline library"
 readme = "README.md"
 license = "BSD-3-Clause"
