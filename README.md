@@ -64,9 +64,11 @@ items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
 ```
 
 Pass `ordered=True` to `map`, `flat_map`, or `filter` to get input order back while
-still running concurrently. The stream is then exactly what `concurrency=1` would
-produce — same values, same order, same failure at the same point — with only the
-timing differing.
+still running concurrently. The stream is then what `concurrency=1` would produce —
+same values, same order, and any ordinary failure at the same point — with only the
+timing differing. Cancellation is the one exception: a `CancelledError` bypasses
+positional ordering and begins teardown immediately, because it means the work is
+being torn down rather than that an item produced a result.
 
 ```python
 # Always [1, 2, 3], and still three predicates in flight
@@ -76,8 +78,11 @@ items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3, ordered=True).co
 Two things follow from taking that guarantee literally, and are worth knowing before
 opting in:
 
-- **A failure waits for its position.** If item 1 is slow and item 2 fails, an ordered
-  stage keeps waiting on item 1 where an unordered one reports the failure at once.
+- **An ordinary failure waits for its position.** If item 1 is slow and item 2 fails,
+  an ordered stage keeps waiting on item 1 where an unordered one reports the failure
+  at once. Cancellation does not wait: ordering never holds it behind an earlier item.
+  Teardown itself still waits for the stage's tasks either way, so an uncancellable
+  task can delay it in ordered and unordered mode alike.
 - **Ordered `flat_map` holds more.** Each in-flight expansion gets its own allowance,
   so the stage holds up to `concurrency * (buffer + 1)` values rather than
   `buffer + concurrency`. An expansion that never ends also starves every item behind

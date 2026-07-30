@@ -445,8 +445,9 @@ class TestConcurrency:
 class TestOrderedMap:
     """`ordered=True` must reproduce what `concurrency=1` would have produced.
 
-    Same values, same order, same failure at the same point -- only the timing
-    differs. Each case here pins one consequence of taking that literally.
+    Same values, same order, any ordinary failure at the same point -- only the
+    timing differs. Each case here pins one consequence of taking that literally.
+    Cancellation is the deliberate exception, in `TestOrderedCancellation`.
     """
 
     @pytest.mark.asyncio
@@ -708,6 +709,68 @@ class TestOrderedFlatMap:
         assert via_op == [1, 2, 3]
         assert via_flow == [1, 2, 3]
         assert filtered == [1, 2, 3]
+
+
+class TestOrderedCancellation:
+    """Cancellation is not a result to be ordered, so it never waits for a turn.
+
+    Each case parks item 0 on an event that is never set, so an implementation
+    that treats cancellation as an ordinary positional failure hangs instead of
+    reporting -- and `wait_for` turns that hang into a `TimeoutError`, which is
+    a different exception than the one asserted.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_worker_cancellation_does_not_wait_for_its_position(self) -> None:
+        hang = asyncio.Event()
+
+        async def work(x: int) -> int:
+            if x == 0:
+                await hang.wait()
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pipe([0, 1]).map(work, concurrency=2, ordered=True).collect(), timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_an_expansion_cancellation_does_not_wait_for_its_position(self) -> None:
+        hang = asyncio.Event()
+
+        async def expand(x: int) -> AsyncIterator[int]:
+            if x == 0:
+                # Parks forever, so the `yield` below is never reached -- but it
+                # keeps this an async generator rather than a coroutine.
+                await hang.wait()
+                yield 0
+            raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pipe([0, 1]).flat_map(expand, concurrency=2, ordered=True).collect(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stage", ["map", "flat_map"])
+    async def test_a_source_cancellation_does_not_wait_for_started_work(self, stage: str) -> None:
+        hang = asyncio.Event()
+
+        async def source() -> AsyncIterator[int]:
+            yield 0
+            raise asyncio.CancelledError
+
+        async def slow_map(x: int) -> int:
+            await hang.wait()
+            return x
+
+        async def slow_expand(x: int) -> list[int]:
+            await hang.wait()
+            return [x]
+
+        builders = {
+            "map": lambda: pipe(source()).map(slow_map, concurrency=2, ordered=True),
+            "flat_map": lambda: pipe(source()).flat_map(slow_expand, concurrency=2, ordered=True),
+        }
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(builders[stage]().collect(), timeout=1)
 
 
 class TestInThread:

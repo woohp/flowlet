@@ -117,6 +117,17 @@ class _Exit(enum.Enum):
         return self is _Exit.NORMAL or self is _Exit.CLOSED
 
 
+def _bypasses_ordering(error: BaseException) -> bool:
+    """Whether an error must reach the consumer without waiting for its position.
+
+    Cancellation is not a result to be ordered: it means the work is being torn
+    down, so holding it behind an item that has not finished stalls a stage that an
+    unordered one would already be tearing down. Anything else raised while processing
+    an item *is* that item's outcome, and belongs at its position.
+    """
+    return isinstance(error, asyncio.CancelledError)
+
+
 def _exit_reason(error: BaseException | None) -> _Exit:
     """Classify how a consumption body ended, from the exception leaving it."""
     if error is None:
@@ -310,11 +321,14 @@ def map[T, U](  # noqa: A001
     `fn` may be sync or async. With `concurrency > 1`, outputs are yielded in
     completion order.
 
-    `ordered` yields them in input order instead: the stream becomes exactly what
-    `concurrency=1` would produce -- same values, same order, same failure at the
-    same point -- with only the timing differing. Note that this includes waiting
-    on a slow item: if item 1 hangs and item 2 fails, an ordered stage waits where
-    an unordered one reports the failure at once.
+    `ordered` yields them in input order instead: the stream becomes what
+    `concurrency=1` would produce -- same values, same order, any ordinary failure at
+    the same point -- with only the timing differing. Note that this includes waiting
+    on a slow item: if item 1 hangs and item 2 fails, an ordered stage waits where an
+    unordered one reports the failure at once. Cancellation is deliberately exempt: it
+    bypasses positional ordering and begins teardown immediately, so ordering never
+    holds it behind an unfinished item. Teardown then waits for the stage's tasks
+    exactly as it does unordered.
     """
     _validate_concurrency(concurrency)
 
@@ -552,12 +566,12 @@ async def _map[T, U](
                     yielded += 1
                     yield value
                     slots.release()
-                case _Error(error) if not ordered:
+                case _Error(error) if not ordered or _bypasses_ordering(error):
                     raise error
                 case _Fed(started, error):
                     started_total = started
                     if error is not None:
-                        if not ordered:
+                        if not ordered or _bypasses_ordering(error):
                             raise error
                         # Held until every started item is delivered: the input
                         # ended here, so this is that position.
@@ -669,7 +683,7 @@ async def _flat_map[T, U](
                     # Returned only after the consumer takes the value, so a
                     # slow consumer holds the slot and throttles production.
                     shared_capacity.release()
-                case _Error(error) if not ordered:
+                case _Error(error) if not ordered or _bypasses_ordering(error):
                     raise error
                 case _Done() if not ordered:
                     finished += 1
@@ -677,7 +691,7 @@ async def _flat_map[T, U](
                 case _Fed(started, error):
                     started_total = started
                     if error is not None:
-                        if not ordered:
+                        if not ordered or _bypasses_ordering(error):
                             raise error
                         # Held until every started expansion is drained: the input
                         # ended here, so this is that position.
