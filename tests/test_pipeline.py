@@ -577,6 +577,139 @@ class TestOrderedMap:
         assert via_flow == [1, 2, 3]
 
 
+class TestOrderedFlatMap:
+    """Ordered `flat_map` groups output by input item, each group in its own order."""
+
+    @pytest.mark.asyncio
+    async def test_output_is_grouped_by_input_item(self) -> None:
+        async def expand(x: int) -> list[int]:
+            await asyncio.sleep((3 - x) * 0.01)
+            return [x, x * 10]
+
+        result = await pipe([1, 2, 3]).flat_map(expand, concurrency=3, ordered=True).collect()
+
+        assert result == [1, 10, 2, 20, 3, 30]
+
+    @pytest.mark.asyncio
+    async def test_ordered_matches_the_sequential_run(self) -> None:
+        delays = [0.03, 0.0, 0.02, 0.01, 0.0]
+
+        async def expand(x: int) -> list[int]:
+            await asyncio.sleep(delays[x])
+            return [x, -x]
+
+        sequential = await pipe(range(len(delays))).flat_map(expand, concurrency=1).collect()
+        ordered = await pipe(range(len(delays))).flat_map(expand, concurrency=4, ordered=True).collect()
+        unordered = await pipe(range(len(delays))).flat_map(expand, concurrency=4).collect()
+
+        assert ordered == sequential
+        assert unordered != sequential, "the delays no longer reorder anything"
+
+    @pytest.mark.asyncio
+    async def test_out_of_turn_expansion_cannot_stall_the_stage(self) -> None:
+        # One shared value allowance deadlocks here, which is why each expansion
+        # gets its own: expansion 1 finishes at once and fills the allowance with
+        # values that cannot be delivered until expansion 0's turn ends, while
+        # expansion 0 has more to publish than one allowance holds.
+        async def expand(x: int) -> AsyncIterator[int]:
+            for i in range(12):
+                if x == 0:
+                    await asyncio.sleep(0)
+                yield x * 100 + i
+
+        stream = pipe([0, 1]).flat_map(expand, concurrency=2, buffer=4, ordered=True)
+        result = await asyncio.wait_for(stream.collect(), timeout=5)
+
+        assert result == [*range(12), *(100 + i for i in range(12))]
+
+    @pytest.mark.asyncio
+    async def test_holds_at_most_concurrency_expansions(self) -> None:
+        # A slot is returned when an expansion's values have been *delivered*, not
+        # when it terminates: an expansion holding undelivered values still holds
+        # memory, so releasing early would let the feeder start another and hold
+        # more than `concurrency * (buffer + 1)` values.
+        release = asyncio.Event()
+        all_slots_used = asyncio.Event()
+        started = 0
+
+        async def expand(x: int) -> list[int]:
+            nonlocal started
+            started += 1
+            if started == 2:
+                all_slots_used.set()
+            if x == 0:
+                await release.wait()
+            return [x]
+
+        stream = pipe(range(100)).flat_map(expand, concurrency=2, ordered=True).__aiter__()
+
+        async def take_first() -> int:
+            return await anext(stream)
+
+        first = asyncio.create_task(take_first())
+        await asyncio.wait_for(all_slots_used.wait(), timeout=5)
+        await settle()
+
+        assert started == 2, f"{started} expansions started against 2 slots"
+
+        release.set()
+        assert await first == 0
+        await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_expansion_failure_surfaces_at_its_input_position(self) -> None:
+        async def expand(x: int) -> list[int]:
+            if x == 1:
+                await asyncio.sleep(0.02)
+                raise RuntimeError("boom")
+            return [x * 10]
+
+        got: list[int] = []
+        with pytest.raises(RuntimeError, match="boom"):
+            async for value in pipe([0, 1, 2]).flat_map(expand, concurrency=3, ordered=True):
+                got.append(value)
+
+        assert got == [0]
+
+    @pytest.mark.asyncio
+    async def test_values_before_a_failure_in_the_same_expansion_arrive_first(self) -> None:
+        async def expand(x: int) -> AsyncIterator[int]:
+            yield x
+            if x == 1:
+                raise RuntimeError("boom")
+
+        got: list[int] = []
+        with pytest.raises(RuntimeError, match="boom"):
+            async for value in pipe([0, 1, 2]).flat_map(expand, concurrency=3, ordered=True):
+                got.append(value)
+
+        assert got == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_filter_keeps_input_order(self) -> None:
+        async def slow_keep(x: int) -> bool:
+            await asyncio.sleep((3 - x) * 0.01)
+            return x != 2
+
+        result = await pipe([1, 2, 3]).filter(slow_keep, concurrency=3, ordered=True).collect()
+
+        assert result == [1, 3]
+
+    @pytest.mark.asyncio
+    async def test_ordered_threads_through_op_and_flow(self) -> None:
+        async def expand(x: int) -> list[int]:
+            await asyncio.sleep((3 - x) * 0.01)
+            return [x]
+
+        via_op = await (pipe([1, 2, 3]) | op.flat_map(expand, concurrency=3, ordered=True)).collect()
+        via_flow = await (pipe([1, 2, 3]) | Flow[int]().flat_map(expand, concurrency=3, ordered=True)).collect()
+        filtered = await (pipe([1, 2, 3]) | op.filter(lambda x: True, concurrency=3, ordered=True)).collect()
+
+        assert via_op == [1, 2, 3]
+        assert via_flow == [1, 2, 3]
+        assert filtered == [1, 2, 3]
+
+
 class TestInThread:
     @pytest.mark.asyncio
     async def test_in_thread_supports_blocking_map(self) -> None:

@@ -133,13 +133,31 @@ SOURCE_SHAPES: dict[str, tuple[Callable[[Any], Any], list[Any]]] = {
     # Ordering changes when a result is delivered, never how the stage cleans up.
     "map_c2_ordered": (lambda source: pipe(source).map(lambda x: x, concurrency=2, ordered=True), [1, 2, 3]),
     "flat_map_c1": (lambda source: pipe(source).flat_map(lambda x: [x], concurrency=1), [1, 2, 3]),
+    # flat_map has no sequential fast path, so ordered at concurrency=1 is its own
+    # configuration: one slot, retired on delivery, against a per-expansion allowance.
+    "flat_map_c1_ordered": (
+        lambda source: pipe(source).flat_map(lambda x: [x], concurrency=1, ordered=True),
+        [1, 2, 3],
+    ),
     "flat_map_c2": (lambda source: pipe(source).flat_map(lambda x: [x], concurrency=2), [1, 2, 3]),
+    "flat_map_c2_ordered": (
+        lambda source: pipe(source).flat_map(lambda x: [x], concurrency=2, ordered=True),
+        [1, 2, 3],
+    ),
     "batch2": (lambda source: pipe(source).batch(2), [[1, 2], [3]]),
 }
 
 EXPANSION_SHAPES: dict[str, tuple[Callable[[Callable[[], Any]], Any], list[Any]]] = {
     "expansion_c1": (lambda make: pipe([0]).flat_map(lambda _: make(), concurrency=1), [1, 2, 3]),
+    "expansion_c1_ordered": (
+        lambda make: pipe([0]).flat_map(lambda _: make(), concurrency=1, ordered=True),
+        [1, 2, 3],
+    ),
     "expansion_c2": (lambda make: pipe([0]).flat_map(lambda _: make(), concurrency=2), [1, 2, 3]),
+    "expansion_c2_ordered": (
+        lambda make: pipe([0]).flat_map(lambda _: make(), concurrency=2, ordered=True),
+        [1, 2, 3],
+    ),
 }
 
 
@@ -245,15 +263,20 @@ async def test_expansion_ownership(shape: str, kind: str, terminal: str, close: 
     )
 
 
+@pytest.mark.parametrize("ordered", [False, True])
 @pytest.mark.parametrize("concurrency", [1, 2])
 @pytest.mark.parametrize("kind", list(KINDS))
 @pytest.mark.asyncio
-async def test_expansion_cleanup_failure_stops_a_live_stage(kind: str, concurrency: int) -> None:
+async def test_expansion_cleanup_failure_stops_a_live_stage(kind: str, concurrency: int, ordered: bool) -> None:
     """A cleanup failure must reach a consumer that is still reading.
 
     Recording it for teardown is not enough on its own: the stage here has plenty
     of work left, so a recorded-only failure would not be reported until the
     source ran dry -- and against an endless source, never.
+
+    Ordered too, which is why an expansion boundary carries its input position: a
+    notification tagged as positionless is never anyone's turn, so it would fall
+    back to teardown and this stage would drain all 50 items first.
     """
     state = Tracked()
     expansions = 0
@@ -265,7 +288,7 @@ async def test_expansion_cleanup_failure_stops_a_live_stage(kind: str, concurren
             return KINDS[kind](state, 1, "exhaust", "fail")
         return [0] * 5
 
-    values, error = await drain(pipe(range(50)).flat_map(expand, concurrency=concurrency))
+    values, error = await drain(pipe(range(50)).flat_map(expand, concurrency=concurrency, ordered=ordered))
 
     assert type(error) is ValueError
     assert str(error) == CLOSE_ERROR
@@ -278,8 +301,11 @@ STAGE_ERROR_SHAPES: dict[str, Callable[[Any, Callable[[int], Any]], Any]] = {
     "map_c2": lambda source, fn: pipe(source).map(fn, concurrency=2),
     "map_c2_ordered": lambda source, fn: pipe(source).map(fn, concurrency=2, ordered=True),
     "flat_map_c1": lambda source, fn: pipe(source).flat_map(fn, concurrency=1),
+    "flat_map_c1_ordered": lambda source, fn: pipe(source).flat_map(fn, concurrency=1, ordered=True),
     "flat_map_c2": lambda source, fn: pipe(source).flat_map(fn, concurrency=2),
+    "flat_map_c2_ordered": lambda source, fn: pipe(source).flat_map(fn, concurrency=2, ordered=True),
     "filter_c2": lambda source, fn: pipe(source).filter(fn, concurrency=2),
+    "filter_c2_ordered": lambda source, fn: pipe(source).filter(fn, concurrency=2, ordered=True),
 }
 
 

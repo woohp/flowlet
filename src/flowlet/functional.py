@@ -36,6 +36,8 @@ class _Error:
 class _Done:
     """One expansion task terminated, successfully or not."""
 
+    seq: int
+
 
 @dataclass(frozen=True)
 class _Fed:
@@ -52,11 +54,11 @@ class _Fed:
 
 
 _UNPOSITIONED = -1
-"""Sequence tag for a failure that has no input position.
+"""Position for an ownership boundary that does not belong to one input item.
 
-Only a cleanup failure notified to a live driver carries this. `flat_map` is the
-one stage that produces them and has no ordered mode yet, so no ordered driver
-reads it.
+A source boundary is the whole input, not a position within it, and its cleanup
+failures are recorded for teardown rather than queued -- so no ordered driver
+reads this. Only an expansion boundary carries a real position.
 """
 
 
@@ -141,15 +143,19 @@ class _Failures[U]:
         self._queue = queue
         self._recorded: list[BaseException] = []
 
-    def report(self, error: BaseException, reason: _Exit) -> None:
-        """Deliver a close failure as this boundary's role requires."""
+    def report(self, error: BaseException, reason: _Exit, seq: int) -> None:
+        """Deliver a close failure as this boundary's role requires.
+
+        `seq` is the input position the boundary belongs to, so an ordered driver
+        can hold a notified failure until its turn instead of jumping the queue.
+        """
         if self._role is _Role.DIRECT:
             if reason.may_surface:
                 raise error
             return
         self._recorded.append(error)
         if self._role is _Role.RETAIN_NOTIFY and self._queue is not None and reason.may_surface:
-            self._queue.put_nowait(_Error(error, _UNPOSITIONED))
+            self._queue.put_nowait(_Error(error, seq))
 
     @property
     def first(self) -> BaseException | None:
@@ -179,9 +185,10 @@ class _OwnedAsync[T]:
     notification to an already-failing driver.
     """
 
-    def __init__(self, source: AsyncIterable[T], failures: _Failures[Any]) -> None:
+    def __init__(self, source: AsyncIterable[T], failures: _Failures[Any], seq: int = _UNPOSITIONED) -> None:
         self._source = source
         self._failures = failures
+        self._seq = seq
         self._iterator: AsyncIterator[T] | None = None
 
     async def __aenter__(self) -> AsyncIterator[T]:
@@ -193,7 +200,7 @@ class _OwnedAsync[T]:
             try:
                 await _aclose(self._iterator)
             except BaseException as close_error:
-                self._failures.report(close_error, _exit_reason(error))
+                self._failures.report(close_error, _exit_reason(error), self._seq)
         return False
 
 
@@ -206,9 +213,10 @@ class _OwnedSync[T]:
     adapting it measured ~40% slower on `plain sync src`.
     """
 
-    def __init__(self, source: Iterable[T], failures: _Failures[Any]) -> None:
+    def __init__(self, source: Iterable[T], failures: _Failures[Any], seq: int = _UNPOSITIONED) -> None:
         self._source = source
         self._failures = failures
+        self._seq = seq
         self._iterator: Iterator[T] | None = None
 
     def __enter__(self) -> Iterator[T]:
@@ -222,7 +230,7 @@ class _OwnedSync[T]:
             try:
                 _close(self._iterator)
             except BaseException as close_error:
-                self._failures.report(close_error, _exit_reason(error))
+                self._failures.report(close_error, _exit_reason(error), self._seq)
 
 
 class _OwnedSource[T]:
@@ -253,7 +261,8 @@ class _OwnedSource[T]:
             elif self._sync_iterator is not None:
                 _close(self._sync_iterator)
         except BaseException as close_error:
-            self._failures.report(close_error, _exit_reason(error))
+            # A source is the whole input rather than a position in it.
+            self._failures.report(close_error, _exit_reason(error), _UNPOSITIONED)
         return False
 
 
@@ -319,7 +328,9 @@ def map[T, U](  # noqa: A001
     return apply
 
 
-def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, buffer: int = DEFAULT_BUFFER) -> Operator[T, U]:
+def flat_map[T, U](
+    fn: Expander[T, U], *, concurrency: int = 1, buffer: int = DEFAULT_BUFFER, ordered: bool = False
+) -> Operator[T, U]:
     """Return an operator that expands each source item into zero or more outputs.
 
     `fn` may return an iterable, async iterable, or an awaitable resolving to
@@ -329,28 +340,38 @@ def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, buffer: int = DE
     full, expansions pause instead of buffering, so large expansions stream. Wide
     expansions go faster with a larger `buffer` at the cost of holding more
     values in memory.
+
+    `ordered` groups the output by input instead: every value from item *n*, in
+    the order that expansion produced them, precedes any value from item *n + 1*.
+    Two costs come with it. Each in-flight expansion gets its own allowance, so the
+    stage holds up to `concurrency * (buffer + 1)` values rather than
+    `buffer + concurrency`. And an expansion that never ends starves every item
+    behind it, where unordered mode would interleave -- so it suits bounded
+    expansions.
     """
     _validate_concurrency(concurrency)
     _validate_buffer(buffer)
 
     def apply(source: Source[T]) -> AsyncIterator[U]:
         # Returned directly, not re-yielded from: see the note in `map`.
-        return _flat_map(source, fn, concurrency, buffer)
+        return _flat_map(source, fn, concurrency, buffer, ordered)
 
     return apply
 
 
-def filter[T](pred: Predicate[T], *, concurrency: int = 1) -> Operator[T, T]:  # noqa: A001
+def filter[T](pred: Predicate[T], *, concurrency: int = 1, ordered: bool = False) -> Operator[T, T]:  # noqa: A001
     """Return an operator that keeps items where `pred` returns true.
 
     `pred` may be sync or async. With `concurrency > 1`, kept items are yielded
-    in completion order.
+    in completion order, or in input order when `ordered` is set.
     """
 
     async def expand(item: T) -> list[T]:
         return [item] if await _maybe_await(pred(item)) else []
 
-    return flat_map(expand, concurrency=concurrency)
+    # Each expansion is at most one value, so the memory ordered `flat_map` warns
+    # about cannot be reached here: `concurrency` values, whatever `buffer` says.
+    return flat_map(expand, concurrency=concurrency, ordered=ordered)
 
 
 def batch[T](size: int) -> Operator[T, list[T]]:
@@ -561,7 +582,9 @@ async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], i
     return await _maybe_await(fn(item))
 
 
-async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: int, buffer: int) -> AsyncIterator[U]:
+async def _flat_map[T, U](
+    source: Source[T], fn: Expander[T, U], concurrency: int, buffer: int, ordered: bool
+) -> AsyncIterator[U]:
     """Flat-map a source with bounded concurrent expansions.
 
     A feeder task owns the source and starts one expansion task per item, while
@@ -569,19 +592,33 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
     driver's await path is what lets a ready value be yielded while the source is
     still blocked producing the next item.
 
-    Two semaphores do separate jobs. `slots`, returned when an expansion
-    terminates, bounds concurrent expansions. `capacity`, returned after a value
-    is yielded, bounds unconsumed values at `buffer` so a slow consumer stalls
-    production instead of letting expansions buffer without limit.
+    Two semaphores do separate jobs. `slots` bounds concurrent expansions.
+    `capacity`, returned after a value is yielded, bounds unconsumed values so a
+    slow consumer stalls production instead of letting expansions buffer freely.
+
+    `ordered` changes both. One shared `capacity` would deadlock: an expansion
+    that finishes early fills it with values awaiting its turn, and the driver
+    cannot drain them until the in-turn expansion -- now unable to publish --
+    finishes. Each expansion therefore gets its own allowance, so an out-of-turn
+    one parks against its own and blocks nobody. And a slot is returned only once
+    an expansion's values have been *delivered*, not when it terminates: an
+    expansion holding undelivered values still holds memory, so freeing its slot
+    early would let the feeder start another and break the bound.
+
+    The price is memory. Each expansion holds up to `buffer` published values plus
+    one it has already pulled while waiting for a permit, so an ordered stage holds
+    up to `concurrency * (buffer + 1)` values against `buffer + concurrency`
+    unordered -- both measured.
     """
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     source_failures = _Failures[U](_Role.RETAIN)
     # An expansion failing leaves the rest of the stage running, so its cleanup
     # failure has to reach a consumer that is still reading, not just teardown.
     expansion_failures = _Failures[U](_Role.RETAIN_NOTIFY, queue)
-    capacity = asyncio.Semaphore(buffer)
+    shared_capacity = asyncio.Semaphore(buffer)
     slots = asyncio.Semaphore(concurrency)
     expansions: set[asyncio.Task[None]] = set()
+    capacities: dict[int, asyncio.Semaphore] = {}
 
     async def feed() -> None:
         started = 0
@@ -594,6 +631,10 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                         item = await anext(items)
                     except StopAsyncIteration:
                         return
+                    capacity = shared_capacity
+                    if ordered:
+                        capacity = asyncio.Semaphore(buffer)
+                        capacities[started] = capacity
                     task = asyncio.create_task(_emit_expansion(fn, item, started, queue, capacity, expansion_failures))
                     expansions.add(task)
                     task.add_done_callback(expansions.discard)
@@ -610,26 +651,59 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
 
     started_total: int | None = None
     finished = 0
+    # Ordered only: values held for an expansion whose turn has not come, which
+    # expansions have terminated, how they failed, and the turn to fill.
+    buffered: dict[int, list[U]] = {}
+    done: set[int] = set()
+    failed: dict[int, BaseException] = {}
+    next_seq = 0
+    source_failure: BaseException | None = None
 
     async with _Stage(source_failures, expansion_failures) as stage:
         stage.supervise_group(expansions)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or finished < started_total:
             match await queue.get():
-                case _Value(value):
+                case _Value(value) if not ordered:
                     yield value
                     # Returned only after the consumer takes the value, so a
                     # slow consumer holds the slot and throttles production.
-                    capacity.release()
-                case _Error(error):
+                    shared_capacity.release()
+                case _Error(error) if not ordered:
                     raise error
-                case _Done():
+                case _Done() if not ordered:
                     finished += 1
                     slots.release()
                 case _Fed(started, error):
                     started_total = started
                     if error is not None:
-                        raise error
+                        if not ordered:
+                            raise error
+                        # Held until every started expansion is drained: the input
+                        # ended here, so this is that position.
+                        source_failure = error
+                case _Value(value, seq):
+                    buffered.setdefault(seq, []).append(value)
+                case _Error(error, seq):
+                    failed.setdefault(seq, error)
+                case _Done(seq):
+                    finished += 1
+                    done.add(seq)
+
+            while ordered:
+                for value in buffered.pop(next_seq, ()):
+                    yield value
+                    capacities[next_seq].release()
+                if next_seq in failed:
+                    raise failed[next_seq]
+                if next_seq not in done:
+                    break
+                capacities.pop(next_seq, None)
+                next_seq += 1
+                slots.release()
+
+        if source_failure is not None:
+            raise source_failure
 
 
 async def _emit_expansion[T, U](
@@ -657,14 +731,14 @@ async def _emit_expansion[T, U](
     try:
         expanded = await _maybe_await(fn(item))
         if isinstance(expanded, AsyncIterable):
-            async with _OwnedAsync(expanded, failures) as async_values:
+            async with _OwnedAsync(expanded, failures, seq) as async_values:
                 async for value in async_values:
                     await capacity.acquire()
                     queue.put_nowait(_Value(value, seq))
         else:
             # Branched rather than adapted: `filter` expands to a sync list per
             # item, so this is a hot path.
-            with _OwnedSync(cast(Iterable[U], expanded), failures) as sync_values:
+            with _OwnedSync(cast(Iterable[U], expanded), failures, seq) as sync_values:
                 for value in sync_values:
                     await capacity.acquire()
                     queue.put_nowait(_Value(value, seq))
@@ -677,7 +751,7 @@ async def _emit_expansion[T, U](
         # The queue is intentionally unbounded so both terminal messages can be
         # sent without awaiting during cancellation cleanup; `capacity`, not the
         # queue size, is what bounds buffering.
-        queue.put_nowait(_Done())
+        queue.put_nowait(_Done(seq))
 
 
 class _Stage:

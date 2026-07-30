@@ -56,12 +56,32 @@ items = await pipe(urls).map(fetch, concurrency=20).collect()
 - **`concurrency=1` (Default)**: Stages process items one at a time. The next item is pulled from the source only after the current one is yielded downstream.
 - **`concurrency > 1`**: The stage eagerly starts up to `concurrency` calls at once and yields results as they complete. Backpressure is implicit: if the downstream consumer is slow, the stage pauses and stops pulling from the source.
 
-**Concurrent stages emit values in completion order.** A faster later item can be yielded before a slower earlier item. If you need to preserve input order, use `concurrency=1`.
+**Concurrent stages emit values in completion order.** A faster later item can be yielded before a slower earlier item.
 
 ```python
 # May return [3, 1, 2], not necessarily [1, 2, 3]
 items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
 ```
+
+Pass `ordered=True` to `map`, `flat_map`, or `filter` to get input order back while
+still running concurrently. The stream is then exactly what `concurrency=1` would
+produce — same values, same order, same failure at the same point — with only the
+timing differing.
+
+```python
+# Always [1, 2, 3], and still three predicates in flight
+items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3, ordered=True).collect()
+```
+
+Two things follow from taking that guarantee literally, and are worth knowing before
+opting in:
+
+- **A failure waits for its position.** If item 1 is slow and item 2 fails, an ordered
+  stage keeps waiting on item 1 where an unordered one reports the failure at once.
+- **Ordered `flat_map` holds more.** Each in-flight expansion gets its own allowance,
+  so the stage holds up to `concurrency * (buffer + 1)` values rather than
+  `buffer + concurrency`. An expansion that never ends also starves every item behind
+  it. It suits bounded expansions.
 
 ## Pipeline stages
 

@@ -57,6 +57,7 @@ class Flow[T, U = T]:
         *,
         concurrency: int = 1,
         buffer: int = functional.DEFAULT_BUFFER,
+        ordered: bool = False,
     ) -> Flow[T, V]:
         """Return a flow that expands each item into zero or more outputs.
 
@@ -64,22 +65,26 @@ class Flow[T, U = T]:
         either. Outputs from concurrent expansions are emitted as they arrive.
 
         `buffer` caps how many expanded values may wait for the consumer before
-        expansions pause.
+        expansions pause. `ordered` groups the output by input item instead, and
+        holds up to `concurrency * (buffer + 1)` values rather than
+        `buffer + concurrency`.
         """
-        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency, buffer=buffer))
+        operator = functional.flat_map(fn, concurrency=concurrency, buffer=buffer, ordered=ordered)
+        return self | Flow._from_operator(operator)
 
     def filter(
         self,
         pred: Predicate[U],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Flow[T, U]:
         """Return a flow that keeps items where `pred` returns true.
 
         `pred` may be sync or async. With concurrent predicates, kept items are
-        emitted in completion order.
+        emitted in completion order, or in input order when `ordered` is set.
         """
-        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
+        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency, ordered=ordered))
 
     def batch(self, size: int) -> Flow[T, list[U]]:
         """Return a flow that collects items into lists of up to `size`."""
@@ -152,6 +157,7 @@ class Pipeline[T]:
         *,
         concurrency: int = 1,
         buffer: int = functional.DEFAULT_BUFFER,
+        ordered: bool = False,
     ) -> Pipeline[U]:
         """Return a pipeline that expands each item into zero or more outputs.
 
@@ -159,22 +165,26 @@ class Pipeline[T]:
         either. Outputs from concurrent expansions are emitted as they arrive.
 
         `buffer` caps how many expanded values may wait for the consumer before
-        expansions pause.
+        expansions pause. `ordered` groups the output by input item instead, and
+        holds up to `concurrency * (buffer + 1)` values rather than
+        `buffer + concurrency`.
         """
-        return self | Flow._from_operator(functional.flat_map(fn, concurrency=concurrency, buffer=buffer))
+        operator = functional.flat_map(fn, concurrency=concurrency, buffer=buffer, ordered=ordered)
+        return self | Flow._from_operator(operator)
 
     def filter(
         self,
         pred: Predicate[T],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Pipeline[T]:
         """Return a pipeline that keeps items where `pred` returns true.
 
         `pred` may be sync or async. With concurrent predicates, kept items are
-        emitted in completion order.
+        emitted in completion order, or in input order when `ordered` is set.
         """
-        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency))
+        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency, ordered=ordered))
 
     def batch(self, size: int) -> Pipeline[list[T]]:
         """Return a pipeline that collects items into lists of up to `size`."""
