@@ -8,19 +8,21 @@ from flowlet.functional import Expander, Predicate
 
 @overload
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1
+    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = False
 ) -> Flow[T, U]: ...
 
 
 @overload
-def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1) -> Flow[T, U]: ...  # noqa: A001
+def map[T, U](  # noqa: A001
+    fn: Callable[[T], U], *, concurrency: int = 1, ordered: bool = False
+) -> Flow[T, U]: ...
 
 
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1
+    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = False
 ) -> Flow[T, U]:
     """Build a reusable one-step flow that applies `fn` to each item."""
-    return Flow._from_operator(functional.map(fn, concurrency=concurrency))
+    return Flow._from_operator(functional.map(fn, concurrency=concurrency, ordered=ordered))
 
 
 def flat_map[T, U](fn: Expander[T, U], *, concurrency: int = 1, buffer: int = functional.DEFAULT_BUFFER) -> Flow[T, U]:

@@ -130,6 +130,8 @@ SOURCE_SHAPES: dict[str, tuple[Callable[[Any], Any], list[Any]]] = {
     "plain": (lambda source: pipe(source), [1, 2, 3]),
     "map_c1": (lambda source: pipe(source).map(lambda x: x, concurrency=1), [1, 2, 3]),
     "map_c2": (lambda source: pipe(source).map(lambda x: x, concurrency=2), [1, 2, 3]),
+    # Ordering changes when a result is delivered, never how the stage cleans up.
+    "map_c2_ordered": (lambda source: pipe(source).map(lambda x: x, concurrency=2, ordered=True), [1, 2, 3]),
     "flat_map_c1": (lambda source: pipe(source).flat_map(lambda x: [x], concurrency=1), [1, 2, 3]),
     "flat_map_c2": (lambda source: pipe(source).flat_map(lambda x: [x], concurrency=2), [1, 2, 3]),
     "batch2": (lambda source: pipe(source).batch(2), [[1, 2], [3]]),
@@ -274,6 +276,7 @@ async def test_expansion_cleanup_failure_stops_a_live_stage(kind: str, concurren
 STAGE_ERROR_SHAPES: dict[str, Callable[[Any, Callable[[int], Any]], Any]] = {
     "map_c1": lambda source, fn: pipe(source).map(fn, concurrency=1),
     "map_c2": lambda source, fn: pipe(source).map(fn, concurrency=2),
+    "map_c2_ordered": lambda source, fn: pipe(source).map(fn, concurrency=2, ordered=True),
     "flat_map_c1": lambda source, fn: pipe(source).flat_map(fn, concurrency=1),
     "flat_map_c2": lambda source, fn: pipe(source).flat_map(fn, concurrency=2),
     "filter_c2": lambda source, fn: pipe(source).filter(fn, concurrency=2),

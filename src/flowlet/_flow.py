@@ -24,6 +24,7 @@ class Flow[T, U = T]:
         fn: Callable[[U], Awaitable[V]],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Flow[T, V]: ...
 
     @overload
@@ -32,6 +33,7 @@ class Flow[T, U = T]:
         fn: Callable[[U], V],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Flow[T, V]: ...
 
     def map[V](
@@ -39,13 +41,15 @@ class Flow[T, U = T]:
         fn: Callable[[U], V] | Callable[[U], Awaitable[V]],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Flow[T, V]:
         """Return a flow that applies `fn` to each item.
 
         `fn` may be sync or async. When `concurrency` is greater than one,
-        results are emitted as calls complete rather than in input order.
+        results are emitted as calls complete rather than in input order, unless
+        `ordered` restores input order at the cost of holding early results.
         """
-        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency))
+        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency, ordered=ordered))
 
     def flat_map[V](
         self,
@@ -115,6 +119,7 @@ class Pipeline[T]:
         fn: Callable[[T], Awaitable[U]],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Pipeline[U]: ...
 
     @overload
@@ -123,6 +128,7 @@ class Pipeline[T]:
         fn: Callable[[T], U],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Pipeline[U]: ...
 
     def map[U](
@@ -130,13 +136,15 @@ class Pipeline[T]:
         fn: Callable[[T], U] | Callable[[T], Awaitable[U]],
         *,
         concurrency: int = 1,
+        ordered: bool = False,
     ) -> Pipeline[U]:
         """Return a pipeline that applies `fn` to each item.
 
         `fn` may be sync or async. When `concurrency` is greater than one,
-        results are emitted as calls complete rather than in input order.
+        results are emitted as calls complete rather than in input order, unless
+        `ordered` restores input order at the cost of holding early results.
         """
-        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency))
+        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency, ordered=ordered))
 
     def flat_map[U](
         self,

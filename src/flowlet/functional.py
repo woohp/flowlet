@@ -18,12 +18,18 @@ class Operator[T, U](Protocol):
 
 @dataclass(frozen=True)
 class _Value[T]:
+    """One result, tagged with the input position it came from."""
+
     value: T
+    seq: int
 
 
 @dataclass(frozen=True)
 class _Error:
+    """One item's failure, tagged with the input position it came from."""
+
     error: BaseException
+    seq: int
 
 
 @dataclass(frozen=True)
@@ -33,7 +39,25 @@ class _Done:
 
 @dataclass(frozen=True)
 class _Fed:
+    """The feeder stopped after starting `started` items, `error` if it failed.
+
+    One terminal message rather than an error followed by a count. A source
+    failure has no input position of its own -- it is what *ended* the input --
+    so an ordered driver has to hold it until every started item is delivered,
+    which means telling it apart from an item's failure.
+    """
+
     started: int
+    error: BaseException | None = None
+
+
+_UNPOSITIONED = -1
+"""Sequence tag for a failure that has no input position.
+
+Only a cleanup failure notified to a live driver carries this. `flat_map` is the
+one stage that produces them and has no ordered mode yet, so no ordered driver
+reads it.
+"""
 
 
 type _MapItem[T] = _Value[T] | _Error | _Fed
@@ -125,7 +149,7 @@ class _Failures[U]:
             return
         self._recorded.append(error)
         if self._role is _Role.RETAIN_NOTIFY and self._queue is not None and reason.may_surface:
-            self._queue.put_nowait(_Error(error))
+            self._queue.put_nowait(_Error(error, _UNPOSITIONED))
 
     @property
     def first(self) -> BaseException | None:
@@ -259,21 +283,29 @@ async def to_async_iter[T](source: Source[T]) -> AsyncIterator[T]:
 
 @overload
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1
+    fn: Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = False
 ) -> Operator[T, U]: ...
 
 
 @overload
-def map[T, U](fn: Callable[[T], U], *, concurrency: int = 1) -> Operator[T, U]: ...  # noqa: A001
+def map[T, U](  # noqa: A001
+    fn: Callable[[T], U], *, concurrency: int = 1, ordered: bool = False
+) -> Operator[T, U]: ...
 
 
 def map[T, U](  # noqa: A001
-    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1
+    fn: Callable[[T], U] | Callable[[T], Awaitable[U]], *, concurrency: int = 1, ordered: bool = False
 ) -> Operator[T, U]:
     """Return an operator that applies `fn` to each source item.
 
     `fn` may be sync or async. With `concurrency > 1`, outputs are yielded in
     completion order.
+
+    `ordered` yields them in input order instead: the stream becomes exactly what
+    `concurrency=1` would produce -- same values, same order, same failure at the
+    same point -- with only the timing differing. Note that this includes waiting
+    on a slow item: if item 1 hangs and item 2 fails, an ordered stage waits where
+    an unordered one reports the failure at once.
     """
     _validate_concurrency(concurrency)
 
@@ -282,7 +314,7 @@ def map[T, U](  # noqa: A001
         # does not close its iterator when GeneratorExit passes through, so a
         # wrapper here would swallow the close and leave the driver's cleanup --
         # cancelling tasks, closing the source -- to garbage collection.
-        return _map(source, fn, concurrency)
+        return _map(source, fn, concurrency, ordered)
 
     return apply
 
@@ -414,7 +446,7 @@ def _validate_buffer(buffer: int) -> None:
 
 
 async def _map[T, U](
-    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int
+    source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int, ordered: bool
 ) -> AsyncIterator[U]:
     """Map a source lazily with bounded in-flight calls.
 
@@ -425,11 +457,14 @@ async def _map[T, U](
     source is still blocked producing the next item.
 
     A slot, returned once a value is yielded, bounds started-but-unyielded work at
-    `concurrency` and gives the stage backpressure.
+    `concurrency` and gives the stage backpressure. `ordered` therefore needs no
+    bound of its own: at most `concurrency` finished results can be waiting for
+    their turn, because a slot is not returned until its result is delivered.
     """
     if concurrency == 1:
-        # The owner sees the whole body, so a failure from `fn` correctly outranks
-        # a failure from closing the source.
+        # Ordering is inherent here, so `ordered` must not move a stage off this
+        # path. The owner sees the whole body, so a failure from `fn` correctly
+        # outranks a failure from closing the source.
         async with _OwnedAsync(to_async_iter(source), _Failures[Any](_Role.DIRECT)) as items:
             async for item in items:
                 yield await _apply_map(fn, item)
@@ -440,20 +475,21 @@ async def _map[T, U](
     slots = asyncio.Semaphore(concurrency)
     workers: set[asyncio.Task[None]] = set()
 
-    async def run(item: T) -> None:
+    async def run(seq: int, item: T) -> None:
         # Every exit publishes exactly one message, cancellation included, so the
         # driver's count of outstanding work can never leave it stranded on `get`.
         try:
             value = await _apply_map(fn, item)
         except BaseException as exc:
-            results.put_nowait(_Error(exc))
+            results.put_nowait(_Error(exc, seq))
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         else:
-            results.put_nowait(_Value(value))
+            results.put_nowait(_Value(value, seq))
 
     async def feed() -> None:
         started = 0
+        failure: BaseException | None = None
         try:
             async with _OwnedSource(source, failures) as items:
                 while True:
@@ -462,39 +498,62 @@ async def _map[T, U](
                         item = await anext(items)
                     except StopAsyncIteration:
                         return
-                    task = asyncio.create_task(run(item))
+                    task = asyncio.create_task(run(started, item))
                     workers.add(task)
                     task.add_done_callback(workers.discard)
                     started += 1
         except BaseException as exc:
-            # Published even when cancelled: a source that raises CancelledError
+            # Reported even when cancelled: a source that raises CancelledError
             # must surface, not look like a short stream. When the cancellation is
             # this driver tearing the feeder down, it has already stopped reading
             # and the message is discarded.
-            results.put_nowait(_Error(exc))
+            failure = exc
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         finally:
             # Reporting the count is what makes termination race-free: the driver
             # never has to inspect a worker set that done callbacks mutate.
-            results.put_nowait(_Fed(started))
+            results.put_nowait(_Fed(started, failure))
 
     started_total: int | None = None
     yielded = 0
+    # Ordered only: results that arrived before their turn, and the turn to fill.
+    waiting: dict[int, _Value[U] | _Error] = {}
+    next_seq = 0
+    source_failure: BaseException | None = None
 
     async with _Stage(failures) as stage:
         stage.supervise_group(workers)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or yielded < started_total:
             match await results.get():
-                case _Value(value):
+                case _Value(value) if not ordered:
                     yielded += 1
                     yield value
                     slots.release()
-                case _Error(error):
+                case _Error(error) if not ordered:
                     raise error
-                case _Fed(started):
+                case _Fed(started, error):
                     started_total = started
+                    if error is not None:
+                        if not ordered:
+                            raise error
+                        # Held until every started item is delivered: the input
+                        # ended here, so this is that position.
+                        source_failure = error
+                case _Value() | _Error() as result:
+                    waiting[result.seq] = result
+                    while next_seq in waiting:
+                        ready = waiting.pop(next_seq)
+                        next_seq += 1
+                        if isinstance(ready, _Error):
+                            raise ready.error
+                        yielded += 1
+                        yield ready.value
+                        slots.release()
+
+        if source_failure is not None:
+            raise source_failure
 
 
 async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
@@ -526,6 +585,7 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
 
     async def feed() -> None:
         started = 0
+        failure: BaseException | None = None
         try:
             async with _OwnedSource(source, source_failures) as items:
                 while True:
@@ -534,19 +594,19 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                         item = await anext(items)
                     except StopAsyncIteration:
                         return
-                    task = asyncio.create_task(_emit_expansion(fn, item, queue, capacity, expansion_failures))
+                    task = asyncio.create_task(_emit_expansion(fn, item, started, queue, capacity, expansion_failures))
                     expansions.add(task)
                     task.add_done_callback(expansions.discard)
                     started += 1
         except BaseException as exc:
-            # Published even when cancelled; see the note in `_map`'s feeder.
-            queue.put_nowait(_Error(exc))
+            # Reported even when cancelled; see the note in `_map`'s feeder.
+            failure = exc
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         finally:
             # Reporting the count is what makes termination race-free: the driver
             # counts `_Done` messages instead of inspecting a mutating task set.
-            queue.put_nowait(_Fed(started))
+            queue.put_nowait(_Fed(started, failure))
 
     started_total: int | None = None
     finished = 0
@@ -566,13 +626,16 @@ async def _flat_map[T, U](source: Source[T], fn: Expander[T, U], concurrency: in
                 case _Done():
                     finished += 1
                     slots.release()
-                case _Fed(started):
+                case _Fed(started, error):
                     started_total = started
+                    if error is not None:
+                        raise error
 
 
 async def _emit_expansion[T, U](
     fn: Expander[T, U],
     item: T,
+    seq: int,
     queue: asyncio.Queue[_QueueItem[U]],
     capacity: asyncio.Semaphore,
     failures: _Failures[U],
@@ -597,16 +660,16 @@ async def _emit_expansion[T, U](
             async with _OwnedAsync(expanded, failures) as async_values:
                 async for value in async_values:
                     await capacity.acquire()
-                    queue.put_nowait(_Value(value))
+                    queue.put_nowait(_Value(value, seq))
         else:
             # Branched rather than adapted: `filter` expands to a sync list per
             # item, so this is a hot path.
             with _OwnedSync(cast(Iterable[U], expanded), failures) as sync_values:
                 for value in sync_values:
                     await capacity.acquire()
-                    queue.put_nowait(_Value(value))
+                    queue.put_nowait(_Value(value, seq))
     except BaseException as exc:
-        queue.put_nowait(_Error(exc))
+        queue.put_nowait(_Error(exc, seq))
         if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
             raise
     finally:

@@ -38,6 +38,18 @@ def process_expand(x: int) -> list[int]:
     return [x, x * 10]
 
 
+async def settle(turns: int = 20) -> None:
+    """Give a parked feeder every chance to start more work than it should.
+
+    Event-driven rather than a wall-clock sleep: waking on a released slot, pulling
+    the next item, and running the new task take a handful of event-loop turns, so
+    yielding a bounded number of times proves the feeder is blocked without making
+    the assertion depend on machine speed.
+    """
+    for _ in range(turns):
+        await asyncio.sleep(0)
+
+
 @pytest.fixture
 def no_cyclic_gc() -> Generator[None]:
     """Stop a cyclic collection from standing in for explicit cleanup.
@@ -428,6 +440,141 @@ class TestConcurrency:
     async def test_invalid_concurrency_raises(self) -> None:
         with pytest.raises(ValueError, match="concurrency"):
             pipe([1]).map(double, concurrency=0)
+
+
+class TestOrderedMap:
+    """`ordered=True` must reproduce what `concurrency=1` would have produced.
+
+    Same values, same order, same failure at the same point -- only the timing
+    differs. Each case here pins one consequence of taking that literally.
+    """
+
+    @pytest.mark.asyncio
+    async def test_map_emits_input_order(self) -> None:
+        async def slow_inverse(x: int) -> int:
+            await asyncio.sleep((3 - x) * 0.01)
+            return x
+
+        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3, ordered=True).collect()
+
+        assert result == [1, 2, 3]
+
+    @pytest.mark.asyncio
+    async def test_ordered_matches_the_sequential_run(self) -> None:
+        # Delays chosen so completion order is neither input order nor its reverse.
+        delays = [0.03, 0.0, 0.02, 0.01, 0.0, 0.04, 0.01]
+
+        async def work(x: int) -> int:
+            await asyncio.sleep(delays[x])
+            return x * 10
+
+        sequential = await pipe(range(len(delays))).map(work, concurrency=1).collect()
+        ordered = await pipe(range(len(delays))).map(work, concurrency=4, ordered=True).collect()
+        unordered = await pipe(range(len(delays))).map(work, concurrency=4).collect()
+
+        assert ordered == sequential
+        assert unordered != sequential, "the delays no longer reorder anything"
+
+    @pytest.mark.asyncio
+    async def test_ordered_at_concurrency_one_stays_sequential(self) -> None:
+        # Ordering is inherent at concurrency=1, so asking for it must not cost the
+        # sequential path its fast route. `fn` running in the consumer's own task is
+        # the observable difference: the concurrent driver runs it in a worker.
+        seen: list[asyncio.Task[Any] | None] = []
+
+        async def record(x: int) -> int:
+            seen.append(asyncio.current_task())
+            return x
+
+        async def run() -> list[int]:
+            return await pipe([1, 2, 3]).map(record, concurrency=1, ordered=True).collect()
+
+        task = asyncio.create_task(run())
+
+        assert await task == [1, 2, 3]
+        assert seen == [task, task, task]
+
+    @pytest.mark.asyncio
+    async def test_failure_surfaces_at_its_input_position(self) -> None:
+        async def work(x: int) -> int:
+            if x == 1:
+                await asyncio.sleep(0.02)
+                raise RuntimeError("boom")
+            return x
+
+        got: list[int] = []
+        with pytest.raises(RuntimeError, match="boom"):
+            async for value in pipe([0, 1, 2]).map(work, concurrency=3, ordered=True):
+                got.append(value)
+
+        # Item 2 finished long before item 1 failed, and is still not delivered:
+        # a failure at position 1 ends the stream there.
+        assert got == [0]
+
+    @pytest.mark.asyncio
+    async def test_source_failure_surfaces_after_every_started_item(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 0
+            yield 1
+            raise RuntimeError("source boom")
+
+        async def work(x: int) -> int:
+            await asyncio.sleep((2 - x) * 0.02)
+            return x
+
+        got: list[int] = []
+        with pytest.raises(RuntimeError, match="source boom"):
+            async for value in pipe(source()).map(work, concurrency=4, ordered=True):
+                got.append(value)
+
+        # The source failed while producing item 2, so it belongs after items 0
+        # and 1 -- even though it was known before either had finished.
+        assert got == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_holds_at_most_concurrency_results(self) -> None:
+        # A slot is not returned until its result is delivered, so waiting for a
+        # turn cannot let the stage run ahead: this is why ordered mode needs no
+        # buffer bound of its own.
+        release = asyncio.Event()
+        all_slots_used = asyncio.Event()
+        started = 0
+
+        async def work(x: int) -> int:
+            nonlocal started
+            started += 1
+            if started == 4:
+                all_slots_used.set()
+            if x == 0:
+                await release.wait()
+            return x
+
+        stream = pipe(range(100)).map(work, concurrency=4, ordered=True).__aiter__()
+
+        async def take_first() -> int:
+            return await anext(stream)
+
+        first = asyncio.create_task(take_first())
+        await asyncio.wait_for(all_slots_used.wait(), timeout=5)
+        await settle()
+
+        assert started == 4, f"{started} items started against 4 slots"
+
+        release.set()
+        assert await first == 0
+        await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
+    async def test_ordered_threads_through_op_and_flow(self) -> None:
+        async def slow_inverse(x: int) -> int:
+            await asyncio.sleep((3 - x) * 0.01)
+            return x
+
+        via_op = await (pipe([1, 2, 3]) | op.map(slow_inverse, concurrency=3, ordered=True)).collect()
+        via_flow = await (pipe([1, 2, 3]) | Flow[int]().map(slow_inverse, concurrency=3, ordered=True)).collect()
+
+        assert via_op == [1, 2, 3]
+        assert via_flow == [1, 2, 3]
 
 
 class TestInThread:
