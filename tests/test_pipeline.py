@@ -277,9 +277,7 @@ class TestConcurrency:
                 yield i
                 await asyncio.sleep(0)
 
-        result = await asyncio.wait_for(
-            pipe(range(8)).flat_map(expand, concurrency=8, buffer=1).collect(), timeout=5
-        )
+        result = await asyncio.wait_for(pipe(range(8)).flat_map(expand, concurrency=8, buffer=1).collect(), timeout=5)
 
         assert sorted(result) == sorted(list(range(20)) * 8)
 
@@ -755,9 +753,7 @@ class TestSourcesAndTerminals:
             ),
         ],
     )
-    async def test_close_releases_the_upstream_source_for_every_operator(
-        self, build: Any, no_cyclic_gc: None
-    ) -> None:
+    async def test_close_releases_the_upstream_source_for_every_operator(self, build: Any, no_cyclic_gc: None) -> None:
         closed = False
 
         async def source() -> AsyncIterator[int]:
@@ -820,9 +816,7 @@ class TestSourcesAndTerminals:
             raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(
-                pipe(source()).flat_map(lambda x: [x], concurrency=concurrency).collect(), timeout=1
-            )
+            await asyncio.wait_for(pipe(source()).flat_map(lambda x: [x], concurrency=concurrency).collect(), timeout=1)
 
     @pytest.mark.asyncio
     async def test_close_releases_a_custom_async_expansion_iterator(self) -> None:
@@ -1016,9 +1010,7 @@ class TestSourcesAndTerminals:
         # The pipeline error is the useful one; a teardown failure must not
         # replace it, or the root cause disappears.
         with pytest.raises(RuntimeError, match="pipeline boom"):
-            await asyncio.wait_for(
-                pipe(source()).map(boom, concurrency=concurrency).collect(), timeout=1
-            )
+            await asyncio.wait_for(pipe(source()).map(boom, concurrency=concurrency).collect(), timeout=1)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1115,9 +1107,7 @@ class TestSourcesAndTerminals:
         # enough: a consumer that is still reading has to be told.
         collected: list[int] = []
         with pytest.raises(ValueError, match="cleanup boom"):
-            async for item in pipe(live()).flat_map(
-                lambda x: OneThenBadClose(), concurrency=1, buffer=4
-            ):
+            async for item in pipe(live()).flat_map(lambda x: OneThenBadClose(), concurrency=1, buffer=4):
                 collected.append(item)
                 if len(collected) > 20:
                     break
