@@ -674,10 +674,27 @@ async def _flat_map[T, U](
         while started_total is None or finished < started_total:
             deliverable: Iterable[_Value[U] | _Error | _Done] = ()
             match await queue.get():
+                case _Value(value) if not ordered:
+                    # Deliberate fast path for the hot arm, like `map`'s
+                    # sequential route: pass-through delivery costs a push, a
+                    # tuple, and a re-dispatch per value, measured ~5% of the
+                    # whole stage. The machinery below stays the one general
+                    # path for everything else.
+                    yield value
+                    # Returned only after the consumer takes the value, so a
+                    # slow consumer holds capacity and throttles production.
+                    shared_capacity.release()
+                case _Value() as message:
+                    deliverable = ordering.push(message, closes=False)
+                case _Done() as message:
+                    finished += 1
+                    deliverable = ordering.push(message, closes=True)
                 case _Error(error) if _bypasses_ordering(error):
                     # Cancellation is teardown, not a result: it never waits
                     # for a turn, whichever mode is running.
                     raise error
+                case _Error() as message:
+                    deliverable = ordering.push(message, closes=False)
                 case _Fed(started, error):
                     started_total = started
                     if error is not None:
@@ -686,11 +703,6 @@ async def _flat_map[T, U](
                         # Held until every started expansion is drained: the input
                         # ended here, so this is that position.
                         source_failure = error
-                case _Done() as message:
-                    finished += 1
-                    deliverable = ordering.push(message, closes=True)
-                case _Value() | _Error() as message:
-                    deliverable = ordering.push(message, closes=False)
 
             for message in deliverable:
                 match message:
