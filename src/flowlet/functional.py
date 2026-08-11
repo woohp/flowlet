@@ -559,23 +559,17 @@ async def _map[T, U](
 
     started_total: int | None = None
     yielded = 0
-    # Ordered only: replays results that arrive before their turn.
-    reorder: _Reorder[_Value[U] | _Error] = _Reorder()
+    ordering = _Ordered[_Value[U] | _Error]() if ordered else _Unordered[_Value[U] | _Error]()
     source_failure: BaseException | None = None
 
     async with _Stage(failures) as stage:
         stage.supervise_group(workers)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or yielded < started_total:
-            # Arm order carries the mode split: each guarded arm takes the
-            # unordered path (or the cancellation bypass), and the unguarded
-            # twin after it is the ordered remainder.
             match await results.get():
-                case _Value(value) if not ordered:
-                    yielded += 1
-                    yield value
-                    slots.release()
-                case _Error(error) if not ordered or _bypasses_ordering(error):
+                case _Error(error) if _bypasses_ordering(error):
+                    # Cancellation is teardown, not a result: it never waits
+                    # for a turn, whichever mode is running.
                     raise error
                 case _Fed(started, error):
                     started_total = started
@@ -586,8 +580,7 @@ async def _map[T, U](
                         # ended here, so this is that position.
                         source_failure = error
                 case _Value() | _Error() as result:
-                    reorder.push(result, closes=True)
-                    for ready in reorder.drain():
+                    for ready in ordering.push(result, closes=True):
                         if isinstance(ready, _Error):
                             raise ready.error
                         yielded += 1
@@ -672,26 +665,19 @@ async def _flat_map[T, U](
 
     started_total: int | None = None
     finished = 0
-    # Ordered only: replays expansion messages that arrive before their turn.
-    reorder: _Reorder[_Value[U] | _Error | _Done] = _Reorder()
+    ordering = _Ordered[_Value[U] | _Error | _Done]() if ordered else _Unordered[_Value[U] | _Error | _Done]()
     source_failure: BaseException | None = None
 
     async with _Stage(source_failures, expansion_failures) as stage:
         stage.supervise_group(expansions)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or finished < started_total:
-            # Arm order carries the mode split; see the note in `_map`.
+            deliverable: Iterable[_Value[U] | _Error | _Done] = ()
             match await queue.get():
-                case _Value(value) if not ordered:
-                    yield value
-                    # Returned only after the consumer takes the value, so a
-                    # slow consumer holds the slot and throttles production.
-                    shared_capacity.release()
-                case _Error(error) if not ordered or _bypasses_ordering(error):
+                case _Error(error) if _bypasses_ordering(error):
+                    # Cancellation is teardown, not a result: it never waits
+                    # for a turn, whichever mode is running.
                     raise error
-                case _Done() if not ordered:
-                    finished += 1
-                    slots.release()
                 case _Fed(started, error):
                     started_total = started
                     if error is not None:
@@ -702,23 +688,25 @@ async def _flat_map[T, U](
                         source_failure = error
                 case _Done() as message:
                     finished += 1
-                    reorder.push(message, closes=True)
+                    deliverable = ordering.push(message, closes=True)
                 case _Value() | _Error() as message:
-                    reorder.push(message, closes=False)
+                    deliverable = ordering.push(message, closes=False)
 
-            if ordered:
-                for message in reorder.drain():
-                    match message:
-                        case _Value(value, seq):
-                            yield value
-                            capacities[seq].release()
-                        case _Error(error):
-                            raise error
-                        case _Done(seq):
-                            # The whole group is delivered: its allowance and
-                            # its slot go back together.
-                            capacities.pop(seq, None)
-                            slots.release()
+            for message in deliverable:
+                match message:
+                    case _Value(value, seq):
+                        yield value
+                        # Returned only after the consumer takes the value, so a
+                        # slow consumer holds capacity and throttles production.
+                        (capacities[seq] if ordered else shared_capacity).release()
+                    case _Error(error):
+                        raise error
+                    case _Done(seq):
+                        # The whole expansion is delivered: its allowance and
+                        # its slot go back together. Unordered, that is simply
+                        # the moment the expansion terminated.
+                        capacities.pop(seq, None)
+                        slots.release()
 
         if source_failure is not None:
             raise source_failure
@@ -772,20 +760,20 @@ async def _emit_expansion[T, U](
         queue.put_nowait(_Done(seq))
 
 
-class _Reorder[M: _Positional]:
-    """Replays positional messages in input order, for the ordered drivers.
+class _Ordered[M: _Positional]:
+    """Replays positional messages in input order.
 
     The queue delivers messages in completion order; this buffer holds any that
     arrive before their position's turn. `push` files a message under its
-    position, and `drain` yields every message whose turn has now come, in the
-    order it was pushed. A push with `closes` retires its position once
-    replayed, letting the turn advance: `map`'s single result closes itself,
-    `flat_map`'s `_Done` closes the expansion it ends.
+    position and returns every message whose turn has now come, in the order it
+    was pushed. A push with `closes` retires its position once replayed, letting
+    the turn advance: `map`'s single result closes itself, `flat_map`'s `_Done`
+    closes the expansion it ends.
 
     Delivery stays with the driver on purpose. Yielding to the consumer,
     returning slots and capacity, and raising a positional failure are the
-    driver's backpressure and teardown, so a reorder buffer that performed them
-    would own half of each stage; replaying messages keeps it a data structure.
+    driver's backpressure and teardown, so a buffer that performed them would
+    own half of each stage; returning messages keeps it a data structure.
     """
 
     def __init__(self) -> None:
@@ -793,20 +781,36 @@ class _Reorder[M: _Positional]:
         self._closed: set[int] = set()
         self._turn = 0
 
-    def push(self, message: M, *, closes: bool) -> None:
-        """File a message under its position."""
-        self._waiting.setdefault(message.seq, []).append(message)
+    def push(self, message: M, *, closes: bool) -> Iterable[M]:
+        """File a message under its position; return what is now in turn."""
+        seq = message.seq
+        self._waiting.setdefault(seq, []).append(message)
         if closes:
-            self._closed.add(message.seq)
+            self._closed.add(seq)
+        if seq != self._turn:
+            # An out-of-turn message cannot unblock the turn.
+            return ()
+        return self._replay()
 
-    def drain(self) -> Iterator[M]:
-        """Yield the in-turn messages, oldest position first."""
+    def _replay(self) -> Iterator[M]:
         while True:
             yield from self._waiting.pop(self._turn, ())
             if self._turn not in self._closed:
                 return
             self._closed.discard(self._turn)
             self._turn += 1
+
+
+class _Unordered[M]:
+    """Passes messages straight through: completion order is arrival order.
+
+    The null half of `_Ordered`'s contract, so each driver has one delivery
+    path and the mode is chosen at construction instead of guarded per arm.
+    """
+
+    def push(self, message: M, *, closes: bool) -> tuple[M, ...]:
+        """Every message is in turn the moment it arrives."""
+        return (message,)
 
 
 class _Stage:
