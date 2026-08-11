@@ -62,6 +62,13 @@ reads this. Only an expansion boundary carries a real position.
 """
 
 
+class _Positional(Protocol):
+    """A queue message that belongs to one input position."""
+
+    @property
+    def seq(self) -> int: ...
+
+
 type _MapItem[T] = _Value[T] | _Error | _Fed
 type _QueueItem[T] = _Value[T] | _Error | _Done | _Fed
 
@@ -552,9 +559,8 @@ async def _map[T, U](
 
     started_total: int | None = None
     yielded = 0
-    # Ordered only: results that arrived before their turn, and the turn to fill.
-    waiting: dict[int, _Value[U] | _Error] = {}
-    next_seq = 0
+    # Ordered only: replays results that arrive before their turn.
+    reorder: _Reorder[_Value[U] | _Error] = _Reorder()
     source_failure: BaseException | None = None
 
     async with _Stage(failures) as stage:
@@ -580,10 +586,8 @@ async def _map[T, U](
                         # ended here, so this is that position.
                         source_failure = error
                 case _Value() | _Error() as result:
-                    waiting[result.seq] = result
-                    while next_seq in waiting:
-                        ready = waiting.pop(next_seq)
-                        next_seq += 1
+                    reorder.push(result, closes=True)
+                    for ready in reorder.drain():
                         if isinstance(ready, _Error):
                             raise ready.error
                         yielded += 1
@@ -668,12 +672,8 @@ async def _flat_map[T, U](
 
     started_total: int | None = None
     finished = 0
-    # Ordered only: values held for an expansion whose turn has not come, which
-    # expansions have terminated, how they failed, and the turn to fill.
-    buffered: dict[int, list[U]] = {}
-    done: set[int] = set()
-    failed: dict[int, BaseException] = {}
-    next_seq = 0
+    # Ordered only: replays expansion messages that arrive before their turn.
+    reorder: _Reorder[_Value[U] | _Error | _Done] = _Reorder()
     source_failure: BaseException | None = None
 
     async with _Stage(source_failures, expansion_failures) as stage:
@@ -700,26 +700,25 @@ async def _flat_map[T, U](
                         # Held until every started expansion is drained: the input
                         # ended here, so this is that position.
                         source_failure = error
-                case _Value(value, seq):
-                    buffered.setdefault(seq, []).append(value)
-                case _Error(error, seq):
-                    failed.setdefault(seq, error)
-                case _Done(seq):
+                case _Done() as message:
                     finished += 1
-                    done.add(seq)
+                    reorder.push(message, closes=True)
+                case _Value() | _Error() as message:
+                    reorder.push(message, closes=False)
 
             if ordered:
-                while True:
-                    for value in buffered.pop(next_seq, ()):
-                        yield value
-                        capacities[next_seq].release()
-                    if next_seq in failed:
-                        raise failed[next_seq]
-                    if next_seq not in done:
-                        break
-                    capacities.pop(next_seq, None)
-                    next_seq += 1
-                    slots.release()
+                for message in reorder.drain():
+                    match message:
+                        case _Value(value, seq):
+                            yield value
+                            capacities[seq].release()
+                        case _Error(error):
+                            raise error
+                        case _Done(seq):
+                            # The whole group is delivered: its allowance and
+                            # its slot go back together.
+                            capacities.pop(seq, None)
+                            slots.release()
 
         if source_failure is not None:
             raise source_failure
@@ -771,6 +770,43 @@ async def _emit_expansion[T, U](
         # sent without awaiting during cancellation cleanup; `capacity`, not the
         # queue size, is what bounds buffering.
         queue.put_nowait(_Done(seq))
+
+
+class _Reorder[M: _Positional]:
+    """Replays positional messages in input order, for the ordered drivers.
+
+    The queue delivers messages in completion order; this buffer holds any that
+    arrive before their position's turn. `push` files a message under its
+    position, and `drain` yields every message whose turn has now come, in the
+    order it was pushed. A push with `closes` retires its position once
+    replayed, letting the turn advance: `map`'s single result closes itself,
+    `flat_map`'s `_Done` closes the expansion it ends.
+
+    Delivery stays with the driver on purpose. Yielding to the consumer,
+    returning slots and capacity, and raising a positional failure are the
+    driver's backpressure and teardown, so a reorder buffer that performed them
+    would own half of each stage; replaying messages keeps it a data structure.
+    """
+
+    def __init__(self) -> None:
+        self._waiting: dict[int, list[M]] = {}
+        self._closed: set[int] = set()
+        self._turn = 0
+
+    def push(self, message: M, *, closes: bool) -> None:
+        """File a message under its position."""
+        self._waiting.setdefault(message.seq, []).append(message)
+        if closes:
+            self._closed.add(message.seq)
+
+    def drain(self) -> Iterator[M]:
+        """Yield the in-turn messages, oldest position first."""
+        while True:
+            yield from self._waiting.pop(self._turn, ())
+            if self._turn not in self._closed:
+                return
+            self._closed.discard(self._turn)
+            self._turn += 1
 
 
 class _Stage:
