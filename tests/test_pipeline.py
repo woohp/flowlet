@@ -533,6 +533,29 @@ class TestOrderedMap:
         assert got == [0, 1]
 
     @pytest.mark.asyncio
+    async def test_an_item_failure_outranks_a_held_source_failure(self) -> None:
+        # Sequentially, item 1's failure means the source is never pulled past it,
+        # so the source failure never happens. The ordered stage reproduces that:
+        # the held source failure is dropped when an item's turn raises first.
+        async def source() -> AsyncIterator[int]:
+            yield 0
+            yield 1
+            raise RuntimeError("source boom")
+
+        async def work(x: int) -> int:
+            if x == 1:
+                raise ValueError("item boom")
+            await asyncio.sleep(0.02)
+            return x
+
+        got: list[int] = []
+        with pytest.raises(ValueError, match="item boom"):
+            async for value in pipe(source()).map(work, concurrency=4, ordered=True):
+                got.append(value)
+
+        assert got == [0]
+
+    @pytest.mark.asyncio
     async def test_holds_at_most_concurrency_results(self) -> None:
         # A slot is not returned until its result is delivered, so waiting for a
         # turn cannot let the stage run ahead: this is why ordered mode needs no
@@ -685,6 +708,49 @@ class TestOrderedFlatMap:
                 got.append(value)
 
         assert got == [0, 1]
+
+    @pytest.mark.asyncio
+    async def test_source_failure_surfaces_after_every_started_expansion(self) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 1
+            yield 2
+            raise RuntimeError("source boom")
+
+        async def expand(x: int) -> list[int]:
+            await asyncio.sleep((2 - x) * 0.02)
+            return [x, x * 10]
+
+        got: list[int] = []
+        with pytest.raises(RuntimeError, match="source boom"):
+            async for value in pipe(source()).flat_map(expand, concurrency=4, ordered=True):
+                got.append(value)
+
+        # The source failed while producing the third item, so it belongs after
+        # both started expansions -- even though it was known before either had
+        # finished.
+        assert got == [1, 10, 2, 20]
+
+    @pytest.mark.asyncio
+    async def test_an_expansion_failure_outranks_a_held_source_failure(self) -> None:
+        # The sequential-equivalence argument from the `map` twin, applied to the
+        # drain loop: a positional failure raises before the held source failure.
+        async def source() -> AsyncIterator[int]:
+            yield 0
+            yield 1
+            raise RuntimeError("source boom")
+
+        async def expand(x: int) -> list[int]:
+            if x == 1:
+                raise ValueError("expansion boom")
+            await asyncio.sleep(0.02)
+            return [x]
+
+        got: list[int] = []
+        with pytest.raises(ValueError, match="expansion boom"):
+            async for value in pipe(source()).flat_map(expand, concurrency=4, ordered=True):
+                got.append(value)
+
+        assert got == [0]
 
     @pytest.mark.asyncio
     async def test_filter_keeps_input_order(self) -> None:

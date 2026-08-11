@@ -561,6 +561,9 @@ async def _map[T, U](
         stage.supervise_group(workers)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or yielded < started_total:
+            # Arm order carries the mode split: each guarded arm takes the
+            # unordered path (or the cancellation bypass), and the unguarded
+            # twin after it is the ordered remainder.
             match await results.get():
                 case _Value(value) if not ordered:
                     yielded += 1
@@ -677,6 +680,7 @@ async def _flat_map[T, U](
         stage.supervise_group(expansions)
         stage.supervise(asyncio.create_task(feed()))
         while started_total is None or finished < started_total:
+            # Arm order carries the mode split; see the note in `_map`.
             match await queue.get():
                 case _Value(value) if not ordered:
                     yield value
@@ -704,17 +708,18 @@ async def _flat_map[T, U](
                     finished += 1
                     done.add(seq)
 
-            while ordered:
-                for value in buffered.pop(next_seq, ()):
-                    yield value
-                    capacities[next_seq].release()
-                if next_seq in failed:
-                    raise failed[next_seq]
-                if next_seq not in done:
-                    break
-                capacities.pop(next_seq, None)
-                next_seq += 1
-                slots.release()
+            if ordered:
+                while True:
+                    for value in buffered.pop(next_seq, ()):
+                        yield value
+                        capacities[next_seq].release()
+                    if next_seq in failed:
+                        raise failed[next_seq]
+                    if next_seq not in done:
+                        break
+                    capacities.pop(next_seq, None)
+                    next_seq += 1
+                    slots.release()
 
         if source_failure is not None:
             raise source_failure
