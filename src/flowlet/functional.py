@@ -179,8 +179,8 @@ class _OwnedAsync[T]:
     Do not infer that reason from the iterator's own iteration instead. A body
     that fails after receiving a value closes the iterator, so the close sees
     only the `GeneratorExit` it was sent and reads ordinary abandonment --
-    measurably masking the body's error, and sending an unretractable
-    notification to an already-failing driver.
+    masking the body's error, and sending an unretractable notification to an
+    already-failing driver.
     """
 
     def __init__(self, source: AsyncIterable[T], failures: _Failures[Any], seq: int = _UNPOSITIONED) -> None:
@@ -206,9 +206,9 @@ class _OwnedSync[T]:
     """Owns a sync iterator, under the same policy as `_OwnedAsync`.
 
     Synchronous on purpose, twice over: nothing here awaits, and the async
-    protocol costs two coroutines per owner (~10% on `filter`, which builds one
-    per item); and the body gets the iterator itself, not an async view, because
-    adapting it measured ~40% slower on `plain sync src`.
+    protocol costs two coroutines per owner, which `filter` pays once per item;
+    and the body gets the iterator itself, not an async view, because an adapter
+    costs a generator resumption per value.
     """
 
     def __init__(self, source: Iterable[T], failures: _Failures[Any], seq: int = _UNPOSITIONED) -> None:
@@ -235,8 +235,12 @@ class _OwnedSource[T]:
     """Owns either flavor of source, presenting one async view to the body.
 
     For bodies that pull with `anext` and so cannot cheaply branch on the
-    source's flavor -- the concurrent feeders. A synchronous source pays one
-    adapter generator here, the same layer the previous `_iterate_source` cost.
+    source's flavor -- the concurrent feeders.
+
+    Not `_OwnedAsync(to_async_iter(source))`: that wrapper closes the source
+    inside its own body with direct delivery, so a close failure on exhaustion
+    would raise out of `anext` and end the input, dropping in-flight results
+    instead of leaving them to be delivered before teardown reports it.
     """
 
     def __init__(self, source: Source[T], failures: _Failures[Any]) -> None:
@@ -589,7 +593,7 @@ async def _flat_map[T, U](
     The price is memory. Each expansion holds up to `buffer` published values plus
     one it has already pulled while waiting for a permit, so an ordered stage holds
     up to `concurrency * (buffer + 1)` values against `buffer + concurrency`
-    unordered -- both measured.
+    unordered.
     """
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     source_failures = _Failures[U](_Role.RETAIN)
@@ -642,10 +646,9 @@ async def _flat_map[T, U](
             match await queue.get():
                 case _Value(value) if not ordered:
                     # Deliberate fast path for the hot arm, like `map`'s
-                    # sequential route: pass-through delivery costs a push, a
-                    # tuple, and a re-dispatch per value, measured ~5% of the
-                    # whole stage. The machinery below stays the one general
-                    # path for everything else.
+                    # sequential route: pass-through delivery would cost a push,
+                    # a tuple, and a re-dispatch per value. The machinery below
+                    # stays the one general path for everything else.
                     yield value
                     # Returned only after the consumer takes the value, so a
                     # slow consumer holds capacity and throttles production.

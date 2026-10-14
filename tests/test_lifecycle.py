@@ -8,7 +8,7 @@ failure raised by *the close itself* reaches the consumer.
 The policy is uniform: the same rules hold at every ownership boundary, for every
 stage shape, and for sync and async iterators alike. That uniformity is the point
 of this module -- one rule table applied everywhere, so a stage added later has a
-specification to conform to instead of six precedents to imitate.
+specification to conform to instead of precedents to imitate.
 
 What is contractual:
   * which exception the consumer sees,
