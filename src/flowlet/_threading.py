@@ -5,7 +5,6 @@ import inspect
 import threading
 from collections.abc import Awaitable, Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
 from typing import Any, cast, overload
 
 
@@ -51,23 +50,6 @@ def _is_async_callable(fn: Callable[..., object]) -> bool:
 class ThreadLocalResource[R]:
     """Lazily initialized resource cached independently per thread."""
 
-    class _Sentinel:
-        __slots__ = ("closed", "gen")
-
-        def __init__(self, gen: Generator[Any]) -> None:
-            self.gen = gen
-            self.closed = False
-
-        def close(self) -> None:
-            if self.closed:
-                return
-            self.closed = True
-            self.gen.close()
-
-        def __del__(self) -> None:
-            with suppress(Exception):
-                self.close()
-
     def __init__(self, fn: Callable[[], Any]) -> None:
         unwrapped = inspect.unwrap(fn)
         if _is_async_callable(fn) or inspect.iscoroutinefunction(unwrapped) or inspect.isasyncgenfunction(unwrapped):
@@ -85,30 +67,25 @@ class ThreadLocalResource[R]:
             pass
 
         if self._is_gen:
-            gen = self._make_generator()
+            gen = cast(Generator[R], self._fn())
             try:
                 value = next(gen)
             except StopIteration:
                 raise RuntimeError(f"thread_local generator '{self._name}' did not yield") from None
-            self._local.value = value
-            self._local._sentinel = self._Sentinel(cast(Generator[Any], gen))
-            return value
-
-        value = cast(Callable[[], R], self._fn)()
+            # Kept only in thread-local storage, so when the thread exits, dropping
+            # it finalizes the generator, and that runs its cleanup.
+            self._local.gen = gen
+        else:
+            value = cast(Callable[[], R], self._fn)()
         self._local.value = value
         return value
 
     def close(self) -> None:
-        sentinel = getattr(self._local, "_sentinel", None)
-        with suppress(AttributeError):
-            del self._local._sentinel
-        with suppress(AttributeError):
-            del self._local.value
-        if sentinel is not None:
-            cast(ThreadLocalResource._Sentinel, sentinel).close()
-
-    def _make_generator(self) -> Generator[R]:
-        return cast(Callable[[], Generator[R]], self._fn)()
+        state = vars(self._local)
+        state.pop("value", None)
+        gen = state.pop("gen", None)
+        if gen is not None:
+            gen.close()
 
 
 @overload
@@ -123,7 +100,7 @@ def thread_local[R](fn: Callable[[], Any]) -> ThreadLocalResource[R]:
     """Create a lazily initialized resource cached independently per thread.
 
     For generator factories, the first yielded value is used as the resource;
-    the generator is never resumed and is closed during teardown.
+    the generator is never resumed, and is closed by `close()` or when its thread exits.
     Plain factories have no cleanup.
     """
     return ThreadLocalResource(fn)
