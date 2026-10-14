@@ -85,8 +85,7 @@ class _Role(enum.Enum):
     """How an ownership boundary delivers a failure raised by closing.
 
     Static: a property of the boundary, fixed when the owner is built, and not of
-    any particular exit -- that is `_Exit`. Collapsing the two into one flag is
-    what made this policy hard to keep correct across six call sites.
+    any particular exit -- that is `_may_surface`. Keep the two separate.
     """
 
     DIRECT = "direct"
@@ -105,23 +104,15 @@ class _Role(enum.Enum):
     reported until the source ran dry, and against an endless source never."""
 
 
-class _Exit(enum.Enum):
-    """Why a consumption body ended. Dynamic: potentially different every exit."""
+def _may_surface(error: BaseException | None) -> bool:
+    """Whether a cleanup failure is the most useful thing left to report.
 
-    NORMAL = "normal"
-    CLOSED = "closed"
-    CANCELLED = "cancelled"
-    FAILED = "failed"
-
-    @property
-    def may_surface(self) -> bool:
-        """Whether a cleanup failure is the most useful thing left to report.
-
-        Both directions matter: masking the error that caused the teardown loses
-        the diagnosis, but silent success from `aclose()` hides a leaked
-        resource. So it is reported only when nothing better already is.
-        """
-        return self is _Exit.NORMAL or self is _Exit.CLOSED
+    `error` is what ended the consumption body, so this is per exit. Both
+    directions matter: masking the error that caused the teardown loses the
+    diagnosis, but silent success from `aclose()` hides a leaked resource. So it
+    is reported only after a normal exit or a plain close.
+    """
+    return error is None or isinstance(error, GeneratorExit)
 
 
 def _bypasses_ordering(error: BaseException) -> bool:
@@ -133,17 +124,6 @@ def _bypasses_ordering(error: BaseException) -> bool:
     an item *is* that item's outcome, and belongs at its position.
     """
     return isinstance(error, asyncio.CancelledError)
-
-
-def _exit_reason(error: BaseException | None) -> _Exit:
-    """Classify how a consumption body ended, from the exception leaving it."""
-    if error is None:
-        return _Exit.NORMAL
-    if isinstance(error, GeneratorExit):
-        return _Exit.CLOSED
-    if isinstance(error, asyncio.CancelledError):
-        return _Exit.CANCELLED
-    return _Exit.FAILED
 
 
 class _Failures[U]:
@@ -161,18 +141,18 @@ class _Failures[U]:
         self._queue = queue
         self._recorded: list[BaseException] = []
 
-    def report(self, error: BaseException, reason: _Exit, seq: int) -> None:
+    def report(self, error: BaseException, may_surface: bool, seq: int) -> None:
         """Deliver a close failure as this boundary's role requires.
 
         `seq` is the input position the boundary belongs to, so an ordered driver
         can hold a notified failure until its turn instead of jumping the queue.
         """
         if self._role is _Role.DIRECT:
-            if reason.may_surface:
+            if may_surface:
                 raise error
             return
         self._recorded.append(error)
-        if self._role is _Role.RETAIN_NOTIFY and self._queue is not None and reason.may_surface:
+        if self._role is _Role.RETAIN_NOTIFY and self._queue is not None and may_surface:
             self._queue.put_nowait(_Error(error, seq))
 
     @property
@@ -218,7 +198,7 @@ class _OwnedAsync[T]:
             try:
                 await _aclose(self._iterator)
             except BaseException as close_error:
-                self._failures.report(close_error, _exit_reason(error), self._seq)
+                self._failures.report(close_error, _may_surface(error), self._seq)
         return False
 
 
@@ -248,7 +228,7 @@ class _OwnedSync[T]:
             try:
                 _close(self._iterator)
             except BaseException as close_error:
-                self._failures.report(close_error, _exit_reason(error), self._seq)
+                self._failures.report(close_error, _may_surface(error), self._seq)
 
 
 class _OwnedSource[T]:
@@ -280,7 +260,7 @@ class _OwnedSource[T]:
                 _close(self._sync_iterator)
         except BaseException as close_error:
             # A source is the whole input rather than a position in it.
-            self._failures.report(close_error, _exit_reason(error), _UNPOSITIONED)
+            self._failures.report(close_error, _may_surface(error), _UNPOSITIONED)
         return False
 
 
@@ -865,7 +845,7 @@ class _Stage:
             if failure is None:
                 failure = record.first
 
-        if failure is not None and _exit_reason(error).may_surface:
+        if failure is not None and _may_surface(error):
             raise failure
         return False
 
@@ -877,7 +857,7 @@ def _is_cancelling() -> bool:
     reading raised". In the first case the driver has stopped reading, so
     publishing to the queue is not enough and the failure must also be re-raised.
 
-    Concerns a *task's* exception, not cleanup precedence -- `_Exit` covers that.
+    Concerns a *task's* exception, not cleanup precedence -- `_may_surface` covers that.
     """
     task = asyncio.current_task()
     return task is not None and bool(task.cancelling())
