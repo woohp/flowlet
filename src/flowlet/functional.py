@@ -317,7 +317,8 @@ def map[T, U](  # noqa: A001
     holds it behind an unfinished item. Teardown then waits for the stage's tasks
     exactly as it does unordered.
     """
-    _validate_concurrency(concurrency)
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
 
     def apply(source: Source[T]) -> AsyncIterator[U]:
         # Return the driver itself rather than re-yielding from it. `async for`
@@ -350,8 +351,10 @@ def flat_map[T, U](
     behind it, where unordered mode would interleave -- so it suits bounded
     expansions.
     """
-    _validate_concurrency(concurrency)
-    _validate_buffer(buffer)
+    if concurrency < 1:
+        raise ValueError("concurrency must be >= 1")
+    if buffer < 1:
+        raise ValueError("buffer must be >= 1")
 
     def apply(source: Source[T]) -> AsyncIterator[U]:
         # Returned directly, not re-yielded from: see the note in `map`.
@@ -455,18 +458,6 @@ async def drain[T](source: Source[T]) -> None:
         pass
 
 
-def _validate_concurrency(concurrency: int) -> None:
-    """Reject invalid stage concurrency before an operator is built."""
-    if concurrency < 1:
-        raise ValueError("concurrency must be >= 1")
-
-
-def _validate_buffer(buffer: int) -> None:
-    """Reject an unusable value buffer before an operator is built."""
-    if buffer < 1:
-        raise ValueError("buffer must be >= 1")
-
-
 async def _map[T, U](
     source: Source[T], fn: Callable[[T], U] | Callable[[T], Awaitable[U]], concurrency: int, ordered: bool
 ) -> AsyncIterator[U]:
@@ -489,7 +480,7 @@ async def _map[T, U](
         # outranks a failure from closing the source.
         async with _OwnedAsync(to_async_iter(source), _Failures[Any](_Role.DIRECT)) as items:
             async for item in items:
-                yield await _apply_map(fn, item)
+                yield await _maybe_await(fn(item))
         return
 
     failures = _Failures[U](_Role.RETAIN)
@@ -501,7 +492,7 @@ async def _map[T, U](
         # Every exit publishes exactly one message, cancellation included, so the
         # driver's count of outstanding work can never leave it stranded on `get`.
         try:
-            value = await _apply_map(fn, item)
+            value = await _maybe_await(fn(item))
         except BaseException as exc:
             results.put_nowait(_Error(exc, seq))
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
@@ -542,9 +533,10 @@ async def _map[T, U](
     ordering = _Ordered[_Value[U] | _Error]() if ordered else _Unordered[_Value[U] | _Error]()
     source_failure: BaseException | None = None
 
-    async with _Stage(failures) as stage:
-        stage.supervise_group(workers)
-        stage.supervise(asyncio.create_task(feed()))
+    # The feeder joins its workers' set without a done callback, so teardown
+    # always awaits it.
+    workers.add(asyncio.create_task(feed()))
+    async with _Stage(workers, failures):
         while started_total is None or yielded < started_total:
             match await results.get():
                 case _Error(error) if _bypasses_ordering(error):
@@ -569,11 +561,6 @@ async def _map[T, U](
 
         if source_failure is not None:
             raise source_failure
-
-
-async def _apply_map[T, U](fn: Callable[[T], U] | Callable[[T], Awaitable[U]], item: T) -> U:
-    """Apply a map function and await the result only when needed."""
-    return await _maybe_await(fn(item))
 
 
 async def _flat_map[T, U](
@@ -648,9 +635,8 @@ async def _flat_map[T, U](
     ordering = _Ordered[_Value[U] | _Error | _Done]() if ordered else _Unordered[_Value[U] | _Error | _Done]()
     source_failure: BaseException | None = None
 
-    async with _Stage(source_failures, expansion_failures) as stage:
-        stage.supervise_group(expansions)
-        stage.supervise(asyncio.create_task(feed()))
+    expansions.add(asyncio.create_task(feed()))
+    async with _Stage(expansions, source_failures, expansion_failures):
         while started_total is None or finished < started_total:
             deliverable: Iterable[_Value[U] | _Error | _Done] = ()
             match await queue.get():
@@ -817,27 +803,18 @@ class _Stage:
     cancelled and awaited first.
     """
 
-    def __init__(self, *records: _Failures[Any]) -> None:
+    def __init__(self, tasks: set[asyncio.Task[Any]], *records: _Failures[Any]) -> None:
+        # A live set: done callbacks add to and remove from it while the stage runs.
+        self._tasks = tasks
         self._records = records
-        self._tasks: list[asyncio.Task[Any]] = []
-        self._groups: list[set[asyncio.Task[Any]]] = []
 
-    def supervise(self, task: asyncio.Task[Any]) -> asyncio.Task[Any]:
-        """Supervise one task, returning it for the caller to keep."""
-        self._tasks.append(task)
-        return task
-
-    def supervise_group(self, tasks: set[asyncio.Task[Any]]) -> None:
-        """Supervise a live set that done callbacks add to and remove from."""
-        self._groups.append(tasks)
-
-    async def __aenter__(self) -> "_Stage":
-        return self
+    async def __aenter__(self) -> None:
+        return None
 
     async def __aexit__(self, exc_type: Any, error: BaseException | None, traceback: Any) -> bool:
         failure: BaseException | None = None
         try:
-            await _cancel_tasks([*self._tasks, *(task for group in self._groups for task in group)])
+            await _cancel_tasks(self._tasks)
         except BaseException as exc:
             failure = exc
 
@@ -872,8 +849,6 @@ async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
     task_list = list(tasks)
     for task in task_list:
         task.cancel()
-    if not task_list:
-        return
 
     outcomes = await asyncio.gather(*task_list, return_exceptions=True)
     for outcome in outcomes:
