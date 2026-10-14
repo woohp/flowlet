@@ -1,50 +1,56 @@
-# AGENTS.md
+# flowlet agent guide
 
-## Repo Facts
+flowlet is a small, dependency-free async pipeline library: one package, Python 3.13 (pinned in `pyproject.toml` and `.python-version`). Most of its complexity is deliberate and concentrated in iterator ownership, concurrency, and failure delivery; read the relevant docstrings in `functional.py` before simplifying any of it.
 
-- Trust `pyproject.toml`, `src/flowlet/__init__.py`, `src/flowlet/_flow.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, `tests/test_lifecycle.py`, and `README.md`.
-- Python version is pinned to `3.13` in both `pyproject.toml` and `.python-version`.
-- This repo is a single-package library. The public API currently lives in `src/flowlet/` (`pipe`, `Pipeline`, `Flow`, `op`, and `flowlet.functional`).
-- Tests live in `tests/test_pipeline.py` (behavior and API) and `tests/test_lifecycle.py` (the iterator-ownership specification). There is no CI, pre-commit config, or other repo-local instruction file to consult.
+## Navigation
+
+- `src/flowlet/functional.py` is the execution core: curried operators, the stage drivers, and ownership. `_flow.py` (`pipe`, `Pipeline`, `Flow`) and `op.py` wrap its operators and must not duplicate execution logic. `_threading.py` (`in_thread`, `thread_local`) and `_processing.py` (`in_process`) are executor adapters.
+- The `map`/`flat_map`/`filter`/`batch` signatures repeat across `Pipeline`, `Flow`, `op`, and `functional` because each returns a differently typed object; the typing makes this duplication unavoidable, so do not abstract it away.
+- `tests/test_pipeline.py` covers behavior and API. `tests/test_lifecycle.py` is the specification for iterator ownership (see Testing).
+- Keep `README.md` in sync when public behavior, parameters, or examples change.
+- CI (`.github/workflows/ci.yml`) runs `ruff check`, `ruff format --check`, `mypy`, and `pytest`.
+
+## API conventions
+
+- Use PEP 695 generics (`class Pipeline[T]`, `class Flow[T, U = T]`). For typed sourceless chains start with `Flow[T]()`; bare `Flow()` is `Flow[Any, ...]`.
+- Pipelines are immutable and lazy. `pipe(source).map(...).collect()` is the primary style; `|` with `op.*` is mainly for reusable sourceless `Flow` fragments.
+- `None` is valid data. Never terminate streams with a sentinel value.
+
+## Stage architecture
+
+- Concurrent `map`/`flat_map` hand the source to a feeder task and read results off a queue. Do not move `anext(source)` back into the driver loop: a slow source would then withhold finished results and stall live sources. Racing the pull as a per-item task is far slower, since it pulls one item per event-loop turn.
+- Worker, expansion, and feeder tasks publish every failure, `BaseException` included, and also re-raise while `_is_cancelling()`: during teardown the driver has stopped reading, so publishing alone would lose it. Drivers count outstanding work instead of awaiting tasks, so an exception left on a task object is dropped and the driver can hang.
+- An operator's `apply` must `return` its driver generator, never `async for ... yield` from it. `async for` does not close its iterator when `GeneratorExit` passes through, so the driver's cleanup (cancelling tasks, closing the source) would wait for garbage collection.
+- `map(concurrency=1)` keeps its sequential fast path whatever `ordered` says. `flat_map` has no sequential path, so ordered `flat_map` at `concurrency=1` is a real configuration of the concurrent driver.
+
+## Ordering
+
+- Concurrent stages emit in completion order by default. `ordered=True` is opt-in and must produce what `concurrency=1` would, including holding an ordinary failure until its input position. Cancellation alone bypasses ordering (`_bypasses_ordering`): it is teardown, not an item's outcome. Every other `BaseException` is positional.
+- Each message carries its input position. The delivery policy (`_Ordered` / `_Unordered`) is chosen at construction, so each driver has a single delivery path. Delivery itself (yields, semaphore releases, raising positional failures) stays in the drivers: an ordering layer wrapped around a stage's output sits outside the slot/capacity loop (unbounded buffering) and outside `aclose` propagation. Unordered `flat_map`'s `_Value` arm is a deliberate fast path.
+- Ordered `flat_map` needs both a per-expansion value allowance (one shared allowance deadlocks: an out-of-turn expansion fills it and the in-turn one cannot publish) and a slot returned on *delivery*, not termination (otherwise the feeder starts expansions past the bound). Its memory bound is `concurrency * (buffer + 1)` against `buffer + concurrency` unordered.
+- A source failure has no position of its own; an ordered driver holds it until every started item is delivered. An expansion's cleanup failure is positional, which is why expansion owners carry `seq`.
+
+## Iterator ownership and cleanup failures
+
+- An ownership boundary is a context manager around the code that reads the iterator (`_OwnedAsync`, `_OwnedSync`, `_OwnedSource`), never an async generator that classifies its own iteration: a generator sees only the `GeneratorExit` its close sent and so masks the body's real error.
+- Cleanup-failure policy is two independent facts; do not merge them into one flag. `_Role` is how a boundary delivers (static: raise directly, retain for teardown, or retain and notify a live driver). `_may_surface(error)` is the per-exit precedence rule: a cleanup failure is reported only after a normal exit or a plain close, never over a real error or a cancellation, because that would erase the root cause. `_is_cancelling()` is not part of this precedence.
+- Feeders own their source with `_Role.RETAIN`, so in-flight results are delivered before teardown reports a source's close failure. Do not route a feeder's source through `to_async_iter`, which closes with direct delivery and would end the input early.
+- Every ownership fix has an async and a sync half (`_OwnedAsync`/`_OwnedSync`, source and expansion iterators); change both. `_OwnedSync` is synchronous on purpose: nothing in it awaits, and `filter` builds one per item.
+
+## Testing
+
+- `tests/test_lifecycle.py` is one rule table applied to every ownership boundary, stage shape, and sync/async half. A new stage or cleanup change must conform to it, and an intended behavior change shows up as an edited rule, not an edited assertion. It pins exception identity, a single close attempt, and that nothing hangs. It deliberately does not pin `__context__` or exact output once a failure is in flight, so guarantees about values delivered around a failure need focused tests in `test_pipeline.py`.
+- Prove cleanup without `sleep` or `gc.collect()`; a probe using either passes against broken code. Prefer plain-class iterators over generators when asserting closes, since the cyclic collector can close a generator on its own.
+- Synchronize with events or bounded `asyncio.sleep(0)` turns (`settle()`) instead of wall-clock sleeps and timing-dependent counts.
+- When changing pipeline behavior, run the focused async tests first, then the full suite. `pytest` runs with `-s`, so print output is not captured.
+- Measure performance changes interleaved in one process; drift between sessions on one machine is often larger than the effect being measured.
 
 ## Commands
 
-- Install deps: `uv sync`
-- Lint: `uv run ruff check .`
-- Format: `uv run ruff check --fix-only . && uv run ruff format .`
+- Install: `uv sync`
+- Lint: `uv run ruff check .` (`make lint`)
+- Format: `uv run ruff check --fix-only . && uv run ruff format .` (`make fformat`; `make format` also skips F401 import cleanup)
 - Type-check: `uv run mypy .`
-- Test all: `uv run pytest`
-- Test one case: `uv run pytest tests/test_pipeline.py::TestPipelineApi::test_method_chain_collects_results`
+- Test: `uv run pytest` (`make test`); one case: `uv run pytest tests/test_pipeline.py::TestPipelineApi::test_method_chain_collects_results`
 
-## Makefile Shortcuts
-
-- `make lint` runs `uv run ruff check .`.
-- `make test` runs `uv run pytest`.
-- `make fformat` runs strict formatting: `uv run ruff check --fix-only . && uv run ruff format .`.
-- `make format` is looser and ignores `F401` during fix-only import cleanup before formatting.
-
-## Verified Quirks
-
-- `pytest` currently passes on `HEAD`.
-- `ruff` currently passes on `HEAD`.
-- `mypy` is expected to pass on `HEAD`.
-- `pytest` runs with `-s` from `pyproject.toml`, so print output is not captured.
-
-## Working Notes
-
-- Keep edits small and centralized: most library changes only touch `src/flowlet/__init__.py`, `src/flowlet/_flow.py`, `src/flowlet/functional.py`, `src/flowlet/op.py`, `tests/test_pipeline.py`, and README examples.
-- The codebase already uses PEP 695 generics (`class Pipeline[T]`, `class Flow[T, U]`); match existing styles when editing types.
-- The pipeline API is immutable and async-iterable: `pipe(source).map(...).flat_map(...).filter(...).collect()` is the primary style; `|` with `op.map`/`op.flat_map`/`op.filter` is mainly for reusable sourceless `Flow` fragments.
-- For typed sourceless method-chaining, start with `Flow[T]()`; bare `Flow()` produces `Flow[Any, ...]` because there is no source to infer the input type from.
-- Concurrent stages emit values in completion order by default. `ordered=True` on `map`/`flat_map`/`filter` opts into input order and must stay opt-in: it is what `concurrency=1` would produce, including holding an *ordinary* failure until its input position, which trades a concurrent stage's liveness for determinism. Cancellation is exempt by design (`_bypasses_ordering`): it bypasses positional ordering and begins teardown immediately rather than waiting for an earlier item, because cancellation is teardown and not an item's outcome. That is not the same as reaching the consumer at once -- `_Stage` still gathers supervised tasks, so a task that swallows its cancellation or an `aclose()` that hangs delays teardown in either mode (measured, identically for both). Every other `BaseException` a stage raises *is* that item's outcome and stays positional. `map(concurrency=1)` must stay on its sequential fast path whichever mode is asked for; `flat_map` has no such path, so ordered at `concurrency=1` is a real configuration of the concurrent driver and the ownership matrix covers it explicitly.
-- Ordering rides on a sequence tag: the feeder stamps each item's position, producers publish it on every message, and the ordered driver holds results until their turn. The holding is a delivery policy chosen at construction -- `_Ordered` files each message and returns those whose turn has come, `_Unordered` returns it straight back -- so each driver has one delivery path and no per-arm mode guards; only the `_Fed` hold-vs-raise and the capacity lookup stay mode-aware, because they are semantically different per mode. Delivery -- yields, semaphore releases, raising positional failures -- stays in the drivers on purpose, because an ordering layer wrapped *around* a stage's output sits outside the slot/capacity loop (unbounded buffering) and outside `aclose` propagation. Measured interleaved in-process (session-to-session drift on this machine is bigger than the effects): the unified path is within noise of both master's unordered drivers and the guarded-arm version it replaced, and slightly faster ordered; unordered `flat_map`'s cost vs master was investigated with controlled variants: seq tagging is ~1-2%, and the remaining ~5% was pass-through delivery on the hot `_Value` arm (a push, a tuple, and a re-dispatch per value), recovered by one deliberate fast-path arm -- the same precedent as `map`'s sequential route -- leaving the stage within ~1-2% of master. `map` needs no new bound, because a slot is not returned until its result is delivered. Ordered `flat_map` needs two changes that are not optional -- a per-expansion value allowance, since one shared allowance deadlocks (an out-of-turn expansion fills it, and the in-turn one then cannot publish; reproduced before choosing this), and a slot returned on *delivery* rather than on termination, or the feeder starts expansions past the bound (measured: an ordered stage holds up to `concurrency * (buffer + 1)` values, an unordered one `buffer + concurrency`, the `+ 1` being the value an expansion has pulled but not yet published). An expansion's cleanup failure is positional too, which is why the owner carries a position: tagged positionless it is never anyone's turn and falls back to teardown, losing fail-fast. The per-item allowance allocation is not worth optimizing: ordered mode measured 2-9% slower than unordered across `filter`/`flat_map`/`map` at `concurrency=4`.
-- `flowlet.functional` is the execution core; fluent `Pipeline`/`Flow` and `op` should wrap its curried operators rather than duplicating execution logic.
-- Concurrent `_map`/`_flat_map` deliberately hand the source to a feeder task and read results off a queue. Do not "simplify" this back to awaiting `anext(source)` inside the driver loop: that makes a stage withhold finished results while the source is slow, which stalls live sources. Racing the pull as a per-item task instead was measured 17-22x slower, because it can only pull one item per event-loop turn.
-- Worker and expansion tasks must publish every failure to the queue, `BaseException` included, and additionally re-raise when `_is_cancelling()` — during teardown the driver has stopped reading, so publishing alone loses the exception and the task looks successful. The drivers count outstanding work rather than awaiting each task, so an exception left on a task object is silently dropped and the driver can hang.
-- `tests/test_lifecycle.py` is the specification for iterator ownership, not just a test file: one rule table applied to every ownership boundary, stage shape, and sync/async half. Adding a stage or changing cleanup means conforming to it, and a change that is genuinely intended shows up as an edited rule rather than an edited assertion. It pins exception identity, that the close was attempted once, and that no shape hangs; it deliberately does not pin `__context__` structure or exact value counts once a failure is in flight, both of which are implementation detail. It fails 216/216 against `master`, 44 against `1e1b957`, and exactly the four fail-fast cells against `20c640c`.
-- Cleanup-failure policy is two independent facts, and collapsing them into one flag is what made it hard to keep correct across six sites. `_Role` is *how a boundary delivers* a failure (static, fixed at construction: raise directly / retain for teardown / retain and notify a live driver). `_Exit` is *why the body ended* (dynamic, per exit), and `_Exit.may_surface` is the precedence rule: a cleanup failure is reported only on a normal exit or a plain close, never over a real error or a cancellation. Surfacing unconditionally *erases* the root cause rather than demoting it.
-- An ownership boundary must be a context manager around the code that reads the iterator, never an async generator that classifies its own iteration. `__aexit__` is handed the reason the *body* ended; a generator only sees the `GeneratorExit` that `aclose()` sent it, reads ordinary abandonment, and so lets a cleanup failure mask the body's error or send a live notification that cannot be retracted. Both were reproduced before this shape was chosen. `_is_cancelling()` is therefore *not* part of cleanup precedence — it remains only for re-raising a producer task's exception that publishing alone would lose.
-- Resource ownership is symmetric — every fix has an async and a sync half (`_OwnedAsync`/`_OwnedSync`, source and expansion iterators). Three separate review rounds caught a missed half; check the counterpart before calling one done. `_OwnedSync` is a *synchronous* context manager on purpose: nothing it does awaits, and the async protocol costs two coroutine allocations per owner, which `filter` pays once per item.
-- An operator's `apply` must `return` its driver generator, never `async for ... yield` from it. `async for` does not close its iterator when `GeneratorExit` passes through, so a wrapper swallows `aclose()` and defers the driver's cleanup (cancelling tasks, closing the source) to garbage collection. Tests assert this with no `sleep` and no `gc.collect()`; a probe that uses either will pass against broken code.
-- `None` is valid data. Do not reintroduce sentinel-value stream termination.
-- When changing pipeline behavior, verify focused async tests first, then run the full test suite.
+When done with code changes, run lint, format check, mypy, and the tests, as CI does.
