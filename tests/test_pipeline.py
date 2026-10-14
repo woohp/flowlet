@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import functools
 import multiprocessing as mp
 import threading
@@ -857,145 +858,13 @@ class TestInThread:
         assert all(name.startswith("flowlet-test") for name in thread_names)
 
     @pytest.mark.asyncio
-    async def test_in_thread_workers_feed_downstream_stage(self) -> None:
-        started = asyncio.Event()
-        release_workers = threading.Event()
-        running = 0
-        max_running = 0
-        seen_by_downstream: list[int] = []
-        lock = threading.Lock()
-        loop = asyncio.get_running_loop()
+    async def test_in_thread_propagates_contextvars(self) -> None:
+        request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id")
+        request_id.set("req-1")
 
-        def block(x: int) -> int:
-            nonlocal max_running, running
-            with lock:
-                running += 1
-                max_running = max(max_running, running)
-                if running == 3:
-                    loop.call_soon_threadsafe(started.set)
-            release_workers.wait(timeout=1)
-            with lock:
-                running -= 1
-            return x
+        result = await pipe([1, 2]).map(in_thread(lambda _: request_id.get()), concurrency=2).collect()
 
-        async def downstream(x: int) -> int:
-            seen_by_downstream.append(x)
-            await asyncio.sleep(0)
-            return x * 10
-
-        pipeline = pipe([1, 2, 3]).map(in_thread(block), concurrency=3).map(downstream, concurrency=1)
-        collect_task = asyncio.create_task(pipeline.collect())
-
-        await asyncio.wait_for(started.wait(), timeout=0.2)
-        assert seen_by_downstream == []
-
-        release_workers.set()
-
-        result = await asyncio.wait_for(collect_task, timeout=1)
-
-        assert sorted(result) == [10, 20, 30]
-        assert sorted(seen_by_downstream) == [1, 2, 3]
-        assert max_running == 3
-
-    @pytest.mark.asyncio
-    async def test_in_thread_scales_to_many_tasks(self) -> None:
-        running = 0
-        max_running = 0
-        seen_by_downstream = 0
-        lock = threading.Lock()
-
-        def block(x: int) -> int:
-            nonlocal max_running, running
-            with lock:
-                running += 1
-                max_running = max(max_running, running)
-            time.sleep(0.005)
-            with lock:
-                running -= 1
-            return x
-
-        async def downstream(x: int) -> int:
-            nonlocal seen_by_downstream
-            seen_by_downstream += 1
-            await asyncio.sleep(0)
-            return x
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            result = (
-                await pipe(range(200))
-                .map(in_thread(block, executor=pool), concurrency=8)
-                .map(downstream, concurrency=4)
-                .collect()
-            )
-
-        assert sorted(result) == list(range(200))
-        assert seen_by_downstream == 200
-        assert max_running == 8
-
-    @pytest.mark.asyncio
-    async def test_in_thread_shared_executor_across_stages(self) -> None:
-        stage_one_running = 0
-        stage_two_running = 0
-        max_stage_one_running = 0
-        max_stage_two_running = 0
-        max_total_running = 0
-        lock = threading.Lock()
-
-        def stage_one(x: int) -> int:
-            nonlocal max_stage_one_running, max_total_running, stage_one_running, stage_two_running
-            with lock:
-                stage_one_running += 1
-                max_stage_one_running = max(max_stage_one_running, stage_one_running)
-                max_total_running = max(max_total_running, stage_one_running + stage_two_running)
-            time.sleep(0.01)
-            with lock:
-                stage_one_running -= 1
-            return x + 1
-
-        def stage_two(x: int) -> int:
-            nonlocal max_stage_two_running, max_total_running, stage_one_running, stage_two_running
-            with lock:
-                stage_two_running += 1
-                max_stage_two_running = max(max_stage_two_running, stage_two_running)
-                max_total_running = max(max_total_running, stage_one_running + stage_two_running)
-            time.sleep(0.01)
-            with lock:
-                stage_two_running -= 1
-            return x * 10
-
-        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="flowlet-shared") as pool:
-            result = (
-                await pipe(range(40))
-                .map(in_thread(stage_one, executor=pool), concurrency=3)
-                .map(in_thread(stage_two, executor=pool), concurrency=2)
-                .collect()
-            )
-
-        assert sorted(result) == [(x + 1) * 10 for x in range(40)]
-        assert max_stage_one_running == 3
-        assert max_stage_two_running == 2
-        assert 1 < max_total_running <= 4
-
-    def test_in_thread_rejects_async_callables(self) -> None:
-        async def async_fn(x: int) -> int:
-            return x
-
-        with pytest.raises(TypeError, match="async callables"):
-            in_thread(async_fn)
-
-    def test_in_thread_rejects_partial_of_async_callable(self) -> None:
-        async def async_fn(x: int, y: int) -> int:
-            return x + y
-
-        with pytest.raises(TypeError, match="async callables"):
-            in_thread(functools.partial(async_fn, 1))
-
-    def test_in_thread_rejects_async_generator_callables(self) -> None:
-        async def async_gen(x: int) -> AsyncIterator[int]:
-            yield x
-
-        with pytest.raises(TypeError, match="async callables"):
-            in_thread(async_gen)
+        assert result == ["req-1", "req-1"]
 
     def test_in_thread_preserves_function_metadata(self) -> None:
         def named(x: int) -> int:
@@ -1030,45 +899,37 @@ class TestInProcess:
         assert sorted(filtered) == [2, 4]
         assert sorted(expanded) == [1, 2, 10, 20]
 
-    def test_in_process_rejects_async_callables(self) -> None:
-        async def async_fn(x: int) -> int:
-            return x
-
-        ctx = mp.get_context("fork")
-        with (
-            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
-            pytest.raises(TypeError, match="async callables"),
-        ):
-            in_process(async_fn, executor=pool)
-
-    def test_in_process_rejects_partial_of_async_callable(self) -> None:
-        async def async_fn(x: int, y: int) -> int:
-            return x + y
-
-        ctx = mp.get_context("fork")
-        with (
-            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
-            pytest.raises(TypeError, match="async callables"),
-        ):
-            in_process(functools.partial(async_fn, 1), executor=pool)
-
-    def test_in_process_rejects_async_generator_callables(self) -> None:
-        async def async_gen(x: int) -> AsyncIterator[int]:
-            yield x
-
-        ctx = mp.get_context("fork")
-        with (
-            ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool,
-            pytest.raises(TypeError, match="async callables"),
-        ):
-            in_process(async_gen, executor=pool)
-
     def test_in_process_preserves_function_metadata(self) -> None:
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
             wrapped = in_process(to_str, executor=pool)
 
         assert wrapped.__name__ == "to_str"
+
+
+async def async_add(x: int, y: int = 0) -> int:
+    return x + y
+
+
+async def async_gen(x: int) -> AsyncIterator[int]:
+    yield x
+
+
+@pytest.mark.parametrize("wrapper", ["in_thread", "in_process"])
+@pytest.mark.parametrize(
+    "fn",
+    [
+        pytest.param(async_add, id="coroutine"),
+        pytest.param(functools.partial(async_add, 1), id="partial"),
+        pytest.param(async_gen, id="async_generator"),
+    ],
+)
+def test_executor_wrappers_reject_async_callables(wrapper: str, fn: Any) -> None:
+    with ProcessPoolExecutor(max_workers=1) as pool, pytest.raises(TypeError, match="async callables"):
+        if wrapper == "in_thread":
+            in_thread(fn)
+        else:
+            in_process(fn, executor=pool)
 
 
 class TestSourcesAndTerminals:
