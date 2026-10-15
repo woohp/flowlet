@@ -32,11 +32,9 @@ def main() -> None:
     args = parser.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
-        versions = {
-            args.base: load(args.base, Path(tmp) / "base.py"),
-            args.target or "worktree": load(args.target, Path(tmp) / "target.py"),
-        }
-        asyncio.run(run(versions, args.rounds))
+        base = (args.base, load(args.base, Path(tmp) / "base.py"))
+        target = (args.target or "worktree", load(args.target, Path(tmp) / "target.py"))
+        asyncio.run(run(base, target, args.rounds))
 
 
 def load(rev: str | None, scratch: Path) -> ModuleType:
@@ -63,24 +61,23 @@ def cases(f: ModuleType, ordered: bool) -> dict[str, Case]:
     }
 
 
-async def run(versions: dict[str, ModuleType], rounds: int) -> None:
-    base_name, target_name = versions
+async def run(base: tuple[str, ModuleType], target: tuple[str, ModuleType], rounds: int) -> None:
+    versions = (base, target)
     for ordered in (False, True):
-        best: dict[tuple[str, str], float] = {}
-        for _ in range(rounds):
-            for name, module in versions.items():
-                for case, build in cases(module, ordered).items():
+        best: dict[tuple[str, int], float] = {}
+        for round_ in range(rounds):
+            # Alternate which version goes first so neither always runs in the same slot.
+            for index in (0, 1) if round_ % 2 == 0 else (1, 0):
+                for case, build in cases(versions[index][1], ordered).items():
                     start = time.perf_counter()
                     await build()
                     elapsed = time.perf_counter() - start
-                    best[case, name] = min(best.get((case, name), elapsed), elapsed)
+                    best[case, index] = min(best.get((case, index), elapsed), elapsed)
 
         print(f"--- {'ordered' if ordered else 'unordered'} (best of {rounds}) ---")
-        for case in cases(versions[base_name], ordered):
-            b, t = best[case, base_name], best[case, target_name]
-            print(
-                f"{case:<12} {base_name}={b * 1e3:7.1f}ms  {target_name}={t * 1e3:7.1f}ms  {(t / b - 1) * 100:+5.1f}%"
-            )
+        for case in cases(base[1], ordered):
+            b, t = best[case, 0], best[case, 1]
+            print(f"{case:<12} {base[0]}={b * 1e3:7.1f}ms  {target[0]}={t * 1e3:7.1f}ms  {(t / b - 1) * 100:+5.1f}%")
 
 
 if __name__ == "__main__":

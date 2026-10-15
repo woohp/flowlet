@@ -117,12 +117,12 @@ async def flowlet_processes[T](fn: Callable[[int], T], items: list[int]) -> list
 SCENARIOS: dict[str, dict[str, Callable[[], object]]] = {
     "I/O threads: 100 x 50ms sleep": {
         "concurrent.futures": lambda: executor_map(threads, io_task, IO_ITEMS),
-        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(io_task, IO_ITEMS, backend="thread")),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(io_task, IO_ITEMS, backend="thread", workers=THREADS)),
         "flowlet in_thread": lambda: flowlet_threads(io_task, IO_ITEMS),
     },
     "CPU processes: 200 x heavy math": {
         "concurrent.futures": lambda: executor_map(processes, cpu_task, CPU_ITEMS),
-        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(cpu_task, CPU_ITEMS, backend="process")),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(cpu_task, CPU_ITEMS, backend="process", workers=PROCS)),
         "flowlet in_process": lambda: flowlet_processes(cpu_task, CPU_ITEMS),
     },
     "async I/O: 100 x 50ms sleep": {
@@ -135,7 +135,7 @@ SCENARIOS: dict[str, dict[str, Callable[[], object]]] = {
         # The fair native baseline for an asyncio library: each item crosses
         # between the event loop and a worker thread, which dominates here.
         "asyncio run_in_executor": lambda: asyncio_executor(threads, noop, TINY_ITEMS, THREADS),
-        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(noop, TINY_ITEMS, backend="thread")),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(noop, TINY_ITEMS, backend="thread", workers=THREADS)),
         "flowlet in_thread": lambda: flowlet_threads(noop, TINY_ITEMS),
     },
     "async: 20k no-op": {
