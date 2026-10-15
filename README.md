@@ -6,7 +6,7 @@ Give it some data, add a few steps, and consume the results. Slow steps can run 
 
 ## Requirements
 
-`flowlet` requires Python 3.14 or newer.
+`flowlet` requires Python 3.14 or newer. Concurrent stages start their tasks with `eager_start=True`, so a custom event loop or task factory must accept it: uvloop 0.23 or newer, and task factories that pass extra keyword arguments through to the task.
 
 ## Installation
 
