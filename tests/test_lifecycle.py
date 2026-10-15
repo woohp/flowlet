@@ -1,26 +1,22 @@
 """An executable spec for iterator ownership and cleanup failures.
 
-A stage owns the iterators it reads: its upstream source, and whatever iterator
-a `flat_map` expander returns. Owning one means closing it on every exit
-(exhaustion, consumer close, read failure, cancellation) and deciding how a
-failure from *the close itself* reaches the consumer.
+A stage owns its upstream source and any iterator returned by a `flat_map`
+expander. It must close each iterator on exhaustion, consumer close, read failure,
+or cancellation, and decide how a close failure reaches the consumer.
 
-The same rules hold at every ownership boundary, for every stage shape, and for
-sync and async iterators alike. That's the point of this module: one rule table
-applied everywhere, so a new stage has a spec to meet rather than precedents to
-copy.
+One rule table covers every ownership boundary, stage shape, and sync/async
+variant. New stages must meet the same spec.
 
-What the spec pins:
+The spec checks:
   * which exception the consumer sees,
-  * that the close was attempted exactly once,
-  * that a cleanup failure never replaces a more useful error,
+  * exactly one close attempt,
+  * that cleanup never masks the original error,
   * that nothing hangs.
 
-What it leaves open: `__context__` structure, since whether a suppressed cleanup
-failure is chained, recorded, or dropped is an implementation detail. Nor does it
-pin how many values arrive once a failure is in flight, which with concurrency
-depends on scheduling. Output is bounded rather than pinned, except where nothing
-fails.
+It leaves `__context__` unspecified: chaining, recording, or dropping a suppressed
+cleanup failure is an implementation detail. Once a failure is in flight,
+scheduling affects how many values arrive, so output is bounded, not exact.
+Only a clean drain must match the full expected output.
 """
 
 import asyncio
@@ -41,10 +37,9 @@ TIMEOUT = 5.0
 
 # (terminal, close, consumer) -> the exception the consumer must see, or None.
 #
-# There are two halves. `drain` asks for everything, so it always reaches a
-# failing read, and that read always outranks a cleanup failure. `abandon` stops
-# after one value and never reaches the failing read, so a cleanup failure is
-# all that's left to report.
+# `drain` reads to the end, so a read failure outranks a close failure.
+# `abandon` stops after one value, before any read failure reaches it,
+# so a close failure is all that's left to report.
 RULES: dict[tuple[str, str, str], tuple[type[BaseException], str] | None] = {
     ("exhaust", "ok", "drain"): None,
     ("exhaust", "ok", "abandon"): None,
@@ -62,10 +57,10 @@ RULES: dict[tuple[str, str, str], tuple[type[BaseException], str] | None] = {
 
 
 class Tracked:
-    """Records what a stage did to the iterator it was given.
+    """Shared counters for the plain-class iterator probes.
 
-    It's a plain class, not a generator, so the cyclic collector can never close
-    it on a stage's behalf and let a stage that closes nothing pass.
+    The probes aren't generators, so garbage collection can't close them and
+    accidentally make broken cleanup pass.
     """
 
     def __init__(self) -> None:
@@ -74,7 +69,7 @@ class Tracked:
 
 
 def _next_value(state: Tracked, items: int, terminal: str) -> int:
-    """Yield `items` values, then end however `terminal` says."""
+    """Return up to `items` values, then stop as `terminal` specifies."""
     state.reads += 1
     if state.reads <= items:
         return state.reads
@@ -149,8 +144,8 @@ SOURCE_SHAPES: dict[str, tuple[Callable[[Any], Any], list[Any]]] = {
         lambda source: pipe(source).flat_map(lambda x: [x], concurrency=1),
         [1, 2, 3],
     ),
-    # flat_map has no sequential path, so ordered at concurrency=1 is a real
-    # configuration: one slot, freed on delivery, and a per-expansion allowance.
+    # Even at concurrency=1, flat_map uses its concurrent driver:
+    # one slot, returned on delivery, and a separate allowance for each expansion.
     "flat_map_c1_ordered": (
         lambda source: pipe(source).flat_map(
             lambda x: [x], concurrency=1, ordered=True
@@ -307,14 +302,12 @@ async def test_expansion_cleanup_failure_stops_a_live_stage(
 ) -> None:
     """A cleanup failure must reach a consumer that's still reading.
 
-    Keeping it for teardown isn't enough: this stage has plenty of work left,
-    so a kept-only failure wouldn't be reported until the source ran dry,
-    which for an endless source is never.
+    Keeping it only for teardown would delay the failure until the source runs
+    out, or forever with an endless source.
 
-    This covers ordered mode too, which is why an expansion boundary carries its
-    input position. A failure tagged with no position is never anyone's turn,
-    so it would fall back to teardown and the stage would drain all 50 items
-    first.
+    In ordered mode, the failure needs its expansion's input position.
+    Without one, it would never be its turn, so the stage would drain all
+    50 inputs before teardown reported it.
     """
     state = Tracked()
     expansions = 0

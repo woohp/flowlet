@@ -42,9 +42,8 @@ class Flow[T, U = T]:
     ) -> Flow[T, V]:
         """Apply `fn` to each item.
 
-        `fn` can be sync or async. With `concurrency` above one, results come out
-        as calls finish rather than in input order;
-        `ordered=True` keeps input order by holding back early results.
+        `fn` can be sync or async. With `concurrency > 1`, results arrive as calls
+        finish. Use `ordered=True` to deliver them in input order instead.
         """
         return self | Flow._from_operator(
             functional.map(fn, concurrency=concurrency, ordered=ordered)
@@ -63,10 +62,10 @@ class Flow[T, U = T]:
         `fn` can return an iterable, an async iterable, or an awaitable of either.
         Concurrent expansions interleave their values as they arrive.
 
-        `buffer` caps how many values can wait for the consumer before expansions
-        pause. `ordered=True` keeps each item's values together, in input order,
-        and can hold up to `concurrency * (buffer + 1)` values
-        instead of `buffer + concurrency`.
+        `buffer` limits values waiting for the consumer. With `ordered=True`,
+        expansions are delivered in input order, each with its own buffer.
+        The stage can then hold up to `concurrency * (buffer + 1)` values,
+        compared with `buffer + concurrency` unordered.
         """
         operator = functional.flat_map(
             fn, concurrency=concurrency, buffer=buffer, ordered=ordered
@@ -114,8 +113,8 @@ class Flow[T, U = T]:
 class Pipeline[T]:
     """A lazy async pipeline bound to a source.
 
-    Each method returns a new pipeline. Nothing runs until you iterate it
-    or call a terminal method such as `collect()`.
+    Adding a stage returns a new pipeline. Nothing runs until you iterate it
+    or consume it with `collect()` or `drain()`.
     """
 
     _source: Source[Any]
@@ -148,9 +147,8 @@ class Pipeline[T]:
     ) -> Pipeline[U]:
         """Apply `fn` to each item.
 
-        `fn` can be sync or async. With `concurrency` above one, results come out
-        as calls finish rather than in input order;
-        `ordered=True` keeps input order by holding back early results.
+        `fn` can be sync or async. With `concurrency > 1`, results arrive as calls
+        finish. Use `ordered=True` to deliver them in input order instead.
         """
         return self | Flow._from_operator(
             functional.map(fn, concurrency=concurrency, ordered=ordered)
@@ -169,10 +167,10 @@ class Pipeline[T]:
         `fn` can return an iterable, an async iterable, or an awaitable of either.
         Concurrent expansions interleave their values as they arrive.
 
-        `buffer` caps how many values can wait for the consumer before expansions
-        pause. `ordered=True` keeps each item's values together, in input order,
-        and can hold up to `concurrency * (buffer + 1)` values
-        instead of `buffer + concurrency`.
+        `buffer` limits values waiting for the consumer. With `ordered=True`,
+        expansions are delivered in input order, each with its own buffer.
+        The stage can then hold up to `concurrency * (buffer + 1)` values,
+        compared with `buffer + concurrency` unordered.
         """
         operator = functional.flat_map(
             fn, concurrency=concurrency, buffer=buffer, ordered=ordered

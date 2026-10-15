@@ -15,7 +15,7 @@ flowlet is a small async pipeline library with no dependencies: one package, on 
 - Use PEP 695 generics (`class Pipeline[T]`, `class Flow[T, U = T]`). Start typed sourceless chains with `Flow[T]()`; bare `Flow()` is `Flow[Any, ...]`.
 - Pipelines are immutable and lazy. `pipe(source).map(...).collect()` is the main style; `|` with `op.*` is mostly for reusable sourceless `Flow` fragments.
 - `None` is ordinary data. Never end a stream with a sentinel value.
-- Lines are ruff's default 88 columns. Wrap comments and docstrings to fit, breaking at a punctuation mark when one falls near the end of a line. Keep prose concise and plain-spoken.
+- Lines use ruff's default 88-column ceiling, not a target width. When a sentence end or clause break falls in the last 10–15 columns of a comment or docstring, break there rather than carrying a word or two past it. Don't break at commas inside lists or code references. Keep prose concise and plain-spoken.
 
 ## Stage architecture
 

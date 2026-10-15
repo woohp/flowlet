@@ -6,7 +6,7 @@ Give it some data, add a few steps, and consume the results. Slow steps can run 
 
 ## Requirements
 
-`flowlet` requires Python 3.14 or newer. Concurrent stages create their tasks with `eager_start=True`, so a custom event loop or task factory has to accept that argument. For uvloop, that means 0.23 or newer.
+`flowlet` requires Python 3.14 or newer. Concurrent stages use `eager_start=True`, so custom event loops and task factories must accept that argument. If you use uvloop, you need 0.23 or newer.
 
 ## Installation
 
@@ -53,8 +53,8 @@ Concurrency is set per stage.
 items = await pipe(urls).map(fetch, concurrency=20).collect()
 ```
 
-- **`concurrency=1` (the default)**: the stage handles one item at a time, and pulls the next item from the source only after the current one has gone downstream.
-- **`concurrency > 1`**: the stage runs up to `concurrency` calls at once and yields results as they finish. Backpressure is built in: if the consumer is slow, the stage pauses and stops pulling from the source.
+- **`concurrency=1` (the default)**: the stage handles one input at a time, pulling the next only after the current input's results have gone downstream.
+- **`concurrency > 1`**: the stage runs up to `concurrency` calls at once and yields results as they finish. A slow consumer applies backpressure: the stage pauses and stops pulling from the source.
 
 **Concurrent stages emit values in completion order.** A fast later item can come out before a slow earlier one.
 
@@ -63,7 +63,7 @@ items = await pipe(urls).map(fetch, concurrency=20).collect()
 items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3).collect()
 ```
 
-Pass `ordered=True` to `map`, `flat_map`, or `filter` to get input order back while still running concurrently. The output is then exactly what `concurrency=1` would produce: same values, same order, and any ordinary failure at the same point. Only the timing differs. Cancellation is the one exception. A `CancelledError` doesn't wait its turn, because it means the stage is shutting down, not that an item finished.
+Pass `ordered=True` to `map`, `flat_map`, or `filter` to preserve input order while running concurrently. Output matches `concurrency=1`: the same values, order, and ordinary failures. Only the timing differs. Cancellation is the exception: a `CancelledError` starts shutdown without waiting its turn.
 
 ```python
 # Always [1, 2, 3], with three predicates still running at once
@@ -72,8 +72,8 @@ items = await pipe([1, 2, 3]).filter(async_pred, concurrency=3, ordered=True).co
 
 Two consequences are worth knowing before you opt in:
 
-- **A failure waits its turn.** If item 1 is slow and item 2 fails, an ordered stage keeps waiting on item 1, where an unordered one would raise right away. Cancellation doesn't wait. Either way, shutdown waits for the stage's tasks, so a task that ignores cancellation delays it in both modes.
-- **Ordered `flat_map` holds more.** Each running expansion gets its own buffer, so the stage can hold up to `concurrency * (buffer + 1)` values instead of `buffer + concurrency`. And an expansion that never ends blocks every item behind it, so ordered mode suits expansions that finish.
+- **A failure waits its turn.** If item 1 is slow and item 2 fails, an ordered stage waits for item 1. An unordered stage cancels pending work instead of waiting for item 1's result, then raises after cleanup. Cancellation doesn't wait in either mode, but shutdown still waits for the stage's tasks. A task that ignores cancellation delays both modes.
+- **Ordered `flat_map` holds more.** Each running expansion gets its own buffer, so the stage can hold up to `concurrency * (buffer + 1)` values instead of `buffer + concurrency`. An expansion that never ends blocks every item behind it; use ordered mode for expansions that finish.
 
 ## Pipeline stages
 
@@ -107,7 +107,7 @@ Use `.flat_map(...)` when each input can produce zero, one, or many outputs.
 links = await pipe(pages).flat_map(extract_links).collect()
 ```
 
-`flat_map(fn)` takes a sync or async function that returns an iterable or async iterable. Each one streams into the pipeline, so an async expansion can yield values before it finishes.
+`flat_map(fn)` accepts a sync or async function returning an iterable or async iterable. Each expansion streams its values into the pipeline without waiting to finish.
 
 If `fn` returns a single value, use `.map(fn)` instead.
 
@@ -169,11 +169,10 @@ await pipe(events).map(write_to_log, concurrency=20).drain()
 | `.collect()` | Consume into a `list` | Consumer |
 | `.drain()` | Consume and discard output | Consumer |
 
-`flat_map(fn)` holds at most `buffer` expanded values (256 by default) that the consumer hasn't taken yet. Once that's full, expansions pause until the consumer catches up, so a large expansion streams instead of piling up in memory.
+`flat_map(fn)` buffers up to `buffer` expanded values (256 by default), shared across expansions. Each expansion can also hold one value while waiting for buffer space. When the buffer fills, expansions pause until the consumer catches up, so a large expansion streams instead of piling up in memory. With `ordered=True`, each expansion gets its own buffer instead (see [Concurrency and order](#concurrency-and-order)).
 
 ```python
-# A larger buffer speeds up wide expansions but holds more values in memory;
-# a smaller one keeps memory tighter.
+# A larger buffer trades memory for throughput on wide expansions.
 rows = pipe(files).flat_map(parse_rows, concurrency=8, buffer=2048)
 ```
 
@@ -201,7 +200,7 @@ links = await pipe(pages).through(extract).collect()
 
 - `Flow[T]()` starts a fragment whose input is `T`.
 - `Flow[T, U]` is the type of a fragment that takes `T` and produces `U`.
-- Bare `Flow()` is `Flow[Any, Any]`. Prefer `Flow[T]()` so type checkers can check your pipeline.
+- Bare `Flow()` is `Flow[Any, Any]`. Prefer `Flow[T]()` to retain type checking across stages.
 
 ## Blocking synchronous work
 
@@ -209,7 +208,7 @@ Don't run blocking sync code directly on the event loop. Wrap it with `in_thread
 
 ### Blocking I/O with `in_thread`
 
-Use `in_thread(...)` for blocking calls that should run in a thread, such as filesystem access, blocking SDKs, or blocking network clients.
+Use `in_thread(...)` for blocking I/O, such as filesystem access or calls to synchronous SDKs and network clients.
 
 ```python
 from flowlet import in_thread, pipe
@@ -247,7 +246,7 @@ with ThreadPoolExecutor(max_workers=16) as pool:
 
 ### Per-thread resources with `thread_local`
 
-Use `thread_local` for blocking clients or sessions that should be created once per worker thread and reused by later calls on that thread.
+Use `thread_local` to create a blocking client or session once per worker thread and reuse it on later calls.
 
 ```python
 from flowlet import in_thread, pipe, thread_local
@@ -266,9 +265,11 @@ def load_s3(key):
 items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
 ```
 
-Plain factories work too, when no cleanup is needed. With a generator factory, the first value it yields is cached per thread. The generator is never resumed; it's closed by `.close()` or when its thread exits. A cleanup error at thread exit has no caller to go to, so Python reports it through `sys.unraisablehook`. `s3.close()` closes only the current thread's resource and clears that thread's cache.
+Plain factories work too if no cleanup is needed. With a generator factory, the first yielded value is cached per thread. The generator is never resumed; `.close()` or thread exit closes it and runs its cleanup. At thread exit, cleanup errors go to `sys.unraisablehook` because there's no caller to receive them.
 
-To clean up worker resources at a known point, manage the `ThreadPoolExecutor` with a `with` block. When the block exits, the pool shuts down, its threads exit, and the per-thread generators they created are closed:
+`s3.close()` closes only the current thread's resource and clears its cache.
+
+For cleanup at a known point, manage the `ThreadPoolExecutor` with a `with` block. On exit, the pool shuts down, its threads exit, and their resource generators close:
 
 ```python
 from concurrent.futures import ThreadPoolExecutor
@@ -287,11 +288,15 @@ def fetch(url):
     return session().get(url)
 
 with ThreadPoolExecutor(max_workers=16) as pool:
-    pages = await pipe(urls).map(in_thread(fetch, executor=pool), concurrency=64).collect()
-# After the with block, the pool's threads have exited and their sessions are closed.
+    pages = await (
+        pipe(urls)
+        .map(in_thread(fetch, executor=pool), concurrency=64)
+        .collect()
+    )
+# The worker threads have exited and their sessions are closed.
 ```
 
-This only covers resources created on that executor's threads. Resources created on other threads, such as asyncio's default pool, stay open until those threads exit or call `.close()` themselves.
+This covers only resources created on that executor's threads. Resources on other threads, including asyncio's default pool, stay open until those threads exit or explicitly close them.
 
 ### CPU-bound work with `in_process`
 
@@ -302,16 +307,20 @@ from concurrent.futures import ProcessPoolExecutor
 from flowlet import in_process, pipe
 
 with ProcessPoolExecutor(max_workers=8) as pool:
-    items = await pipe(keys).map(in_process(crunch, executor=pool), concurrency=8).collect()
+    items = await (
+        pipe(keys)
+        .map(in_process(crunch, executor=pool), concurrency=8)
+        .collect()
+    )
 ```
 
-Unlike `in_thread(...)`, which can fall back to asyncio's default thread pool, `in_process(...)` always needs an explicit `ProcessPoolExecutor`, since process pools have to be created and shut down explicitly.
+`in_process(...)` requires an explicit `ProcessPoolExecutor`; you manage its lifetime. Unlike `in_thread(...)`, it has no default pool.
 
-The default start method is `forkserver` on Linux and `spawn` on macOS and Windows, and neither can run lambdas or locally defined functions. So the function must be defined at module level, and it, its arguments, and its return value must be picklable.
+The default start method is `forkserver` on Linux and `spawn` on macOS and Windows. Define worker functions at module level, not as lambdas or local functions. The function, its arguments, and its return value must all be picklable.
 
-`in_process(...)` doesn't carry `contextvars` into workers. `in_thread(...)` can copy the context into another thread, but a `contextvars.Context` can't be pickled, so it can't reach another process.
+Unlike `in_thread(...)`, `in_process(...)` doesn't copy `contextvars` into workers: a `contextvars.Context` can't be pickled.
 
-Cancelling stops waiting for the result, but a call already running in a `ProcessPoolExecutor` can't be cancelled on its own. Use `concurrency` and the pool's worker count to throttle.
+Cancellation stops waiting for a result but can't interrupt a call already running in the process pool. Limit work with `concurrency` and the pool's worker count.
 
 ## Pipe operator syntax
 
@@ -371,9 +380,9 @@ pages = fetch_pages(urls)  # an AsyncIterator
 
 ### Errors
 
-Pipelines **fail fast**. If a stage raises, the pipeline raises right away and cancels any pending work.
+**Pipelines fail fast by default.** When a stage fails, the pipeline cancels pending work, waits for cleanup, then raises the error. With `ordered=True`, ordinary failures wait for their input position; cancellation never waits its turn.
 
-To handle errors without stopping the pipeline, catch them inside your stage function. With `.flat_map(...)`, a failure can produce zero outputs:
+To handle errors without stopping the pipeline, catch them inside your stage function. With `.flat_map(...)`, return an empty iterable to skip a failed item:
 
 ```python
 async def safe_fetch(url):

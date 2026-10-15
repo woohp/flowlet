@@ -2,9 +2,9 @@
 
     uv run python benchmark/ab.py [BASE [TARGET]] [--rounds N]
 
-BASE defaults to HEAD and TARGET to the working tree. Both versions load side by
-side as standalone modules and take turns, so machine drift hits them equally.
-Each cell is the best of `--rounds` runs.
+BASE defaults to HEAD and TARGET to the working tree. Both versions load as
+standalone modules and take turns in one process to reduce machine drift.
+Each cell shows the best time across `--rounds` runs.
 """
 
 import argparse
@@ -42,7 +42,7 @@ def main() -> None:
 
 
 def load(rev: str | None, scratch: Path) -> ModuleType:
-    """Load `functional.py` from git `rev` (via `scratch`), or the worktree if None."""
+    """Load a revision via `scratch`, or the working tree when `rev` is None."""
     path = ROOT / SOURCE
     if rev is not None:
         path = scratch
@@ -85,7 +85,7 @@ async def run(
     for ordered in (False, True):
         best: dict[tuple[str, int], float] = {}
         for round_ in range(rounds):
-            # Alternate who goes first, so neither version always gets the same slot.
+            # Alternate the starting version to avoid favoring either one.
             for index in (0, 1) if round_ % 2 == 0 else (1, 0):
                 for case, build in cases(versions[index][1], ordered).items():
                     start = time.perf_counter()

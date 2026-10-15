@@ -39,12 +39,11 @@ def process_expand(x: int) -> list[int]:
 
 
 async def settle(turns: int = 20) -> None:
-    """Give a parked feeder every chance to start more work than it should.
+    """Give a blocked feeder time to reveal any extra work it could start.
 
-    This yields a fixed number of event-loop turns instead of sleeping. Waking on
-    a released slot, pulling the next item, and running the new task take only a
-    few turns, so this proves the feeder is blocked without depending on machine
-    speed.
+    Yield a fixed number of event-loop turns, not a wall-clock delay.
+    Waking on a slot, pulling an item, and starting a task take only a few turns,
+    regardless of machine speed.
     """
     for _ in range(turns):
         await asyncio.sleep(0)
@@ -276,8 +275,8 @@ class TestConcurrency:
         stream = pipe([1, 2]).flat_map(expand, concurrency=2, buffer=32).__aiter__()
         try:
             await anext(stream)
-            # The consumer stalls while holding one value. Expansions must park once
-            # they fill the buffer, not drain their whole output.
+            # The consumer holds one value and stops reading. Expansions must
+            # pause at the buffer limit, not drain their whole output.
             await asyncio.sleep(0.05)
 
             assert produced <= 48, f"ran {produced} values ahead of a stalled consumer"
@@ -359,8 +358,8 @@ class TestConcurrency:
             for i in range(10_000):
                 yield i
 
-        # The consumer leaves while expansions are parked waiting for capacity;
-        # cancelling them mustn't deadlock on the backpressure credit.
+        # Expansions are waiting for capacity when the consumer leaves.
+        # Cancelling them must not depend on the consumer freeing that capacity.
         async def run() -> None:
             async for _ in pipe(range(20)).flat_map(expand, concurrency=4):
                 break
@@ -389,8 +388,7 @@ class TestConcurrency:
 
         stream = pipe(source()).map(double, concurrency=2).__aiter__()
         try:
-            # Item 1's result is ready, and the stage mustn't sit on it just
-            # because the source hasn't produced a second item yet.
+            # A ready result must not wait for the source's next item.
             assert await asyncio.wait_for(anext(stream), timeout=0.5) == 2
         finally:
             await cast(Any, stream).aclose()
@@ -489,9 +487,8 @@ class TestConcurrency:
 class TestOrderedMap:
     """`ordered=True` must produce exactly what `concurrency=1` would.
 
-    Same values, same order, and any ordinary failure at the same point; only the
-    timing differs. Each case here pins one consequence of taking that literally.
-    Cancellation is the deliberate exception, covered in `TestOrderedCancellation`.
+    Values, order, and ordinary failures match; only timing differs.
+    `TestOrderedCancellation` covers cancellation, which never waits its turn.
     """
 
     @pytest.mark.asyncio
@@ -530,9 +527,8 @@ class TestOrderedMap:
 
     @pytest.mark.asyncio
     async def test_ordered_at_concurrency_one_stays_sequential(self) -> None:
-        # Ordering is built in at concurrency=1, so asking for it mustn't cost
-        # the sequential path its fast route. The visible difference: there, `fn`
-        # runs in the consumer's own task, while the concurrent driver uses a worker.
+        # `ordered` must not bypass the sequential fast path. Here `fn` runs in
+        # the consumer's task; the concurrent driver would use a worker task.
         seen: list[asyncio.Task[Any] | None] = []
 
         async def record(x: int) -> int:
@@ -562,8 +558,7 @@ class TestOrderedMap:
             async for value in pipe([0, 1, 2]).map(work, concurrency=3, ordered=True):
                 got.append(value)
 
-        # Item 2 finished long before item 1 failed, and still isn't delivered:
-        # a failure at position 1 ends the stream there.
+        # Item 2 finished first, but the failure at position 1 ends the stream.
         assert got == [0]
 
     @pytest.mark.asyncio
@@ -588,9 +583,8 @@ class TestOrderedMap:
 
     @pytest.mark.asyncio
     async def test_an_item_failure_outranks_a_held_source_failure(self) -> None:
-        # Run sequentially, item 1's failure means the source is never pulled past
-        # it, so the source failure never happens. The ordered stage matches that
-        # by dropping the held source failure when an item's turn raises first.
+        # A sequential run would stop at item 1 without reaching the source error.
+        # Ordered mode must likewise report the item failure, not the held error.
         async def source() -> AsyncIterator[int]:
             yield 0
             yield 1
@@ -611,9 +605,8 @@ class TestOrderedMap:
 
     @pytest.mark.asyncio
     async def test_holds_at_most_concurrency_results(self) -> None:
-        # A slot isn't returned until its result is delivered, so waiting for a
-        # turn can't let the stage run ahead. That's why ordered mode needs no
-        # buffer bound of its own.
+        # Slots return on delivery, so out-of-turn results can't let the feeder
+        # run ahead. Ordered mode needs no separate buffer limit.
         release = asyncio.Event()
         all_slots_used = asyncio.Event()
         started = 0
@@ -701,10 +694,9 @@ class TestOrderedFlatMap:
 
     @pytest.mark.asyncio
     async def test_out_of_turn_expansion_cannot_stall_the_stage(self) -> None:
-        # This is where one shared value allowance deadlocks, and why each
-        # expansion gets its own. Expansion 1 finishes at once and fills the
-        # allowance with values that can't go out until expansion 0's turn ends,
-        # while expansion 0 has more to publish than one allowance holds.
+        # With a shared allowance, expansion 1 would fill it before expansion 0
+        # could publish all its values. Neither could progress: expansion 0 needs
+        # room, and expansion 1's values must wait for expansion 0.
         async def expand(x: int) -> AsyncIterator[int]:
             for i in range(12):
                 if x == 0:
@@ -718,10 +710,9 @@ class TestOrderedFlatMap:
 
     @pytest.mark.asyncio
     async def test_holds_at_most_concurrency_expansions(self) -> None:
-        # A slot comes back once an expansion's values are *delivered*, not when
-        # it finishes. Undelivered values still take memory, so freeing the slot
-        # early would let the feeder start another expansion and hold more than
-        # `concurrency * (buffer + 1)` values.
+        # Finished expansions still hold undelivered values. Returning their
+        # slots before delivery would let the feeder start more work and exceed
+        # the `concurrency * (buffer + 1)` bound.
         release = asyncio.Event()
         all_slots_used = asyncio.Event()
         started = 0
@@ -805,15 +796,14 @@ class TestOrderedFlatMap:
             ):
                 got.append(value)
 
-        # The source failed while producing the third item, so the failure
-        # belongs after both started expansions, even though it was known before
-        # either finished.
+        # The source error belongs after both started expansions,
+        # even though it happened before either finished.
         assert got == [1, 10, 2, 20]
 
     @pytest.mark.asyncio
     async def test_an_expansion_failure_outranks_a_held_source_failure(self) -> None:
-        # The same sequential argument as the `map` version, applied to the
-        # drain loop: a positional failure raises before the held source failure.
+        # As with map, a sequential run would hit the expansion error first,
+        # without reaching the source error.
         async def source() -> AsyncIterator[int]:
             yield 0
             yield 1
@@ -872,10 +862,9 @@ class TestOrderedFlatMap:
 class TestOrderedCancellation:
     """Cancellation isn't a result to put in order, so it never waits for a turn.
 
-    Each case parks item 0 on an event that's never set. An implementation that
-    treats cancellation as an ordinary positional failure hangs instead of
-    reporting, and `wait_for` turns that hang into a `TimeoutError`, which isn't
-    the exception the test expects.
+    Each case blocks item 0 on an event that's never set. If cancellation waits
+    behind it, the stage hangs. `wait_for` then raises `TimeoutError` instead of
+    the expected `CancelledError`.
     """
 
     @pytest.mark.asyncio
@@ -900,8 +889,8 @@ class TestOrderedCancellation:
 
         async def expand(x: int) -> AsyncIterator[int]:
             if x == 0:
-                # Parks forever, so the `yield` below is never reached, but it keeps
-                # this an async generator rather than a coroutine.
+                # The unreachable yield makes this an async generator,
+                # not a coroutine.
                 await hang.wait()
                 yield 0
             raise asyncio.CancelledError
@@ -1241,8 +1230,8 @@ class TestSourcesAndTerminals:
         await anext(stream)
         await settle()
 
-        # Teardown cancels the feeder first, so when the source and the workers
-        # all fail to clean up, the source's failure wins every time.
+        # The feeder comes first in teardown's task list, so its cleanup failure
+        # takes precedence over the workers' failures.
         with pytest.raises(ValueError, match="source cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 
@@ -1250,9 +1239,9 @@ class TestSourcesAndTerminals:
     @pytest.mark.parametrize(
         "build",
         [
-            # Only the concurrent drivers read ahead, so only they can exhaust the
-            # source before the consumer leaves. The sequential paths are lazy, and
-            # test_source_cleanup_failure_is_reported_by_close covers them.
+            # Only concurrent drivers can exhaust the source before the consumer
+            # leaves. test_source_cleanup_failure_is_reported_by_close covers
+            # sequential paths.
             pytest.param(lambda s: pipe(s).map(double, concurrency=2), id="map_c2"),
             pytest.param(
                 lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2),
@@ -1286,12 +1275,12 @@ class TestSourcesAndTerminals:
         # The value still arrives: the feeder keeps its source's close failure
         # for teardown instead of ending the input with it.
         await anext(stream)
-        # The consumer holds a value, so the driver is parked at its yield.
-        # Waiting on the event pins that state without relying on sleep timing.
+        # The driver is paused at yield. Wait for cleanup without relying on a
+        # timed sleep.
         await asyncio.wait_for(cleanup_ran.wait(), timeout=1)
 
-        # No cancellation was pending when cleanup failed, so the failure must
-        # be kept, not left in a queue nobody reads.
+        # Cleanup failed before cancellation, so the failure must be retained
+        # for teardown, not just published to the now-unread queue.
         with pytest.raises(ValueError, match="cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 

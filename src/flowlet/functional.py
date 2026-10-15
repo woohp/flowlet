@@ -20,14 +20,14 @@ type Predicate[T] = Callable[[T], bool | Awaitable[bool]]
 
 
 class Operator[T, U](Protocol):
-    """A reusable stream transform: a source of `T` in, async `U`s out."""
+    """A reusable stream transform from a source of `T` to an async iterator of `U`."""
 
     def __call__(self, source: Source[T], /) -> AsyncIterator[U]: ...
 
 
 @dataclass(frozen=True)
 class _Value[T]:
-    """One result, tagged with the position of the input it came from."""
+    """A result tagged with its input position."""
 
     value: T
     seq: int
@@ -35,7 +35,7 @@ class _Value[T]:
 
 @dataclass(frozen=True)
 class _Error:
-    """One item's failure, tagged with the position of the input it came from."""
+    """An item's failure tagged with its input position."""
 
     error: BaseException
     seq: int
@@ -52,10 +52,9 @@ class _Done:
 class _Fed:
     """The feeder has stopped after starting `started` items; `error` says why.
 
-    It's one message rather than an error plus a count because a source failure
-    has no position of its own. It ends the input, so an ordered driver must hold
-    it until every started item is delivered, and so must tell it apart from an
-    item's failure.
+    A source failure ends the input but has no item position. Keeping it with the
+    count lets an ordered driver wait until every started item is delivered,
+    rather than treating it as an item's failure.
     """
 
     started: int
@@ -63,11 +62,10 @@ class _Fed:
 
 
 _UNPOSITIONED = -1
-"""The position of an ownership boundary that isn't one input item.
+"""Placeholder position for a boundary that owns the whole source.
 
-A source boundary covers the whole input, and its cleanup failures are kept for
-teardown rather than queued, so no ordered driver ever reads this.
-Only expansion boundaries carry a real position.
+Source cleanup failures are kept for teardown, not queued, so an ordered driver
+never reads this position. Only expansion boundaries carry a real one.
 """
 
 
@@ -93,34 +91,35 @@ event-loop round trip to free a slot.
 class _Role(enum.Enum):
     """How an ownership boundary delivers a failure from closing its iterator.
 
-    This is fixed per boundary when its owner is built.
-    Why a particular exit happened is a separate question, answered by
-    `_may_surface`; keep the two apart.
+    Fixed when the owner is built. Whether a failure should surface on a
+    particular exit is a separate decision, made by `_may_surface`.
     """
 
     DIRECT = "direct"
-    """Raise it right away. For boundaries whose exceptions reach the consumer
-    directly: the public wrapper and the sequential stages."""
+    """Raise directly, for the public wrapper and sequential stages."""
 
     RETAIN = "retain"
-    """Keep it for teardown. For a source read by a feeder task, whose exceptions
-    reach the consumer only through a queue that may no longer be read.
-    An exhausted source can't run away, so the driver delivers in-flight work
-    first and teardown reports the failure afterwards."""
+    """Keep source close failures for teardown when a feeder owns the source.
+
+    An exhausted source can't run away, so its close failure can wait.
+    The driver delivers in-flight results first; the recorded failure survives
+    even if the queue is no longer read.
+    """
 
     RETAIN_NOTIFY = "retain_notify"
-    """Keep it and wake the driver too. For a `flat_map` expansion, whose failure
-    leaves the rest of the stage running: keeping it alone would delay the report
-    until the source ran dry, which for an endless source is never."""
+    """Keep expansion close failures for teardown and notify the driver.
+
+    Other expansions can still be running. Keeping the failure for teardown
+    alone would delay it until the source runs out, possibly forever.
+    """
 
 
 def _may_surface(error: BaseException | None) -> bool:
     """Whether a cleanup failure is the most useful thing left to report.
 
-    `error` is what ended the body that read the iterator. Reporting the cleanup
-    failure over that error would hide the real cause, but staying silent after
-    a clean exit would hide a leaked resource. So report it only after a normal
-    exit or a plain close.
+    `error` ended the body that read the iterator. A cleanup failure must not
+    hide that cause, but it must not go unnoticed after a clean exit either.
+    Report it only after normal completion or a plain close.
     """
     return error is None or isinstance(error, GeneratorExit)
 
@@ -128,22 +127,20 @@ def _may_surface(error: BaseException | None) -> bool:
 def _bypasses_ordering(error: BaseException) -> bool:
     """Whether an error skips the line instead of waiting for its position.
 
-    Cancellation isn't a result to put in order; it means the stage is being torn
-    down. Holding it behind an unfinished item would stall a stage that unordered
-    mode would already be tearing down. Anything else raised for an item *is*
-    that item's outcome, so it waits its turn.
+    Cancellation means teardown, not an item's outcome. Holding it behind an
+    unfinished item would delay shutdown in ordered mode. Every other failure
+    belongs to its item and waits its turn.
     """
     return isinstance(error, asyncio.CancelledError)
 
 
 class _Failures[U]:
-    """Where a stage keeps its cleanup failures, and how it sends them on.
+    """Record cleanup failures for teardown and, if needed, notify the driver.
 
-    A cleanup failure has to outlive the queue: the driver stops reading during
-    teardown, so a failure published only to the queue gets lost. Raising it on
-    the spot would mask whatever caused the teardown instead. So it's recorded
-    where teardown can find it, and `role` decides whether a consumer that's
-    still reading hears about it too.
+    The driver stops reading the queue during teardown, so a failure published
+    only there would be lost. Raising immediately could mask the original error.
+    Recording it preserves it for teardown; `role` decides whether to notify a
+    consumer that's still reading.
     """
 
     def __init__(
@@ -154,10 +151,10 @@ class _Failures[U]:
         self._recorded: list[BaseException] = []
 
     def report(self, error: BaseException, may_surface: bool, seq: int) -> None:
-        """Deliver a close failure the way this boundary's role requires.
+        """Report a close failure according to this boundary's role.
 
-        `seq` is the boundary's input position, so an ordered driver can hold a
-        notified failure until its turn instead of letting it jump the line.
+        `seq` lets an ordered driver hold a notified failure until its input
+        position, just like an item's failure.
         """
         if self._role is _Role.DIRECT:
             if may_surface:
@@ -192,10 +189,10 @@ class _OwnedAsync[T]:
     Wrap it around the code that reads the iterator. On exit it closes the
     iterator and reports any close failure according to why the *body* ended.
 
-    Don't try to tell that from the iterator's own iteration instead.
-    A body that fails after receiving a value closes the iterator, and the close
-    only sees the `GeneratorExit` it was sent, which looks like a plain abandon.
-    That would mask the body's error and notify a driver that's already failing.
+    The iterator can't judge why its caller stopped. If the body fails after
+    receiving a value, closing the iterator sends only `GeneratorExit`.
+    Treating that as a plain close would mask the body's error with a cleanup
+    failure and notify a driver that's already failing.
     """
 
     def __init__(
@@ -229,8 +226,8 @@ class _OwnedSync[T]:
 
     It's synchronous on purpose. Nothing in it awaits, and the async protocol
     costs two coroutines per owner, which `filter` pays for every item.
-    The body also gets the iterator itself rather than an async view,
-    since an adapter costs a generator resumption per value.
+    The body gets the raw iterator, too; an async adapter would add a generator
+    resumption per value.
     """
 
     def __init__(
@@ -248,8 +245,8 @@ class _OwnedSync[T]:
     def __exit__(
         self, exc_type: Any, error: BaseException | None, traceback: Any
     ) -> None:
-        # Returns None, never True: an owner reports cleanup failures, but never
-        # swallows the exception that ended the body.
+        # Returns None, never True: an owner reports cleanup failures,
+        # but never swallows the exception that ended the body.
         if self._iterator is not None:
             try:
                 _close(self._iterator)
@@ -258,15 +255,14 @@ class _OwnedSync[T]:
 
 
 class _OwnedSource[T]:
-    """Owns a source of either kind, and gives the body one async view of it.
+    """Owns a sync or async source and gives feeders an async view.
 
-    It's for the concurrent feeders, which pull with `anext` and can't cheaply
-    branch on the kind of source.
+    Feeders pull with `anext`, so source adaptation belongs here.
 
-    Not `_OwnedAsync(to_async_iter(source))`: that wrapper closes the source
-    inside its own body, raising directly. A close failure on exhaustion would
-    then come out of `anext` and end the input, dropping in-flight results
-    instead of letting them through before teardown reports it.
+    Don't use `_OwnedAsync(to_async_iter(source))`: that wrapper raises close
+    failures directly. On exhaustion, a close failure would come out of `anext`
+    and end the input, dropping in-flight results instead of delivering them
+    before teardown reports it.
     """
 
     def __init__(self, source: Source[T], failures: _Failures[Any]) -> None:
@@ -341,13 +337,12 @@ def map[T, U](  # noqa: A001
     `fn` can be sync or async. With `concurrency > 1`, results come out in the
     order they finish.
 
-    With `ordered=True` they come out in input order instead: the stream is
-    exactly what `concurrency=1` would produce, with only the timing different.
-    That includes waiting on a slow item. If item 1 hangs and item 2 fails,
-    an ordered stage keeps waiting where an unordered one would fail at once.
-    Cancellation is the exception: it starts teardown right away rather than
-    waiting behind an unfinished item, and teardown then waits for the stage's
-    tasks just as it does unordered.
+    With `ordered=True`, output matches `concurrency=1`: the same values, order,
+    and ordinary failures. Only timing differs. If item 1 hangs and item 2 fails,
+    an ordered stage keeps waiting. An unordered stage cancels pending work
+    instead of waiting for item 1's result, then raises after cleanup.
+    Cancellation starts shutdown immediately in either mode,
+    but shutdown still waits for the stage's tasks.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -378,13 +373,11 @@ def flat_map[T, U](
     expansions pause rather than pile up, so large expansions stream.
     A bigger `buffer` speeds up wide expansions at the cost of memory.
 
-    With `ordered=True`, output is grouped by input: all of item *n*'s values,
-    in the order its expansion produced them, come before any of item *n + 1*'s.
-    That has two costs. Each running expansion gets its own allowance, so the
-    stage can hold up to `concurrency * (buffer + 1)` values instead of
-    `buffer + concurrency`. And an expansion that never ends starves every item
-    behind it, where unordered mode would interleave them, so ordered mode suits
-    expansions that finish.
+    With `ordered=True`, all of item *n*'s values come before item *n + 1*'s,
+    preserving order within each expansion. Each running expansion gets its own
+    buffer, so the stage can hold up to `concurrency * (buffer + 1)` values
+    instead of `buffer + concurrency`. An expansion that never ends blocks every
+    item behind it; unordered mode would interleave them.
     """
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -410,9 +403,8 @@ def filter[T](  # noqa: A001
     async def expand(item: T) -> list[T]:
         return [item] if await _maybe_await(pred(item)) else []
 
-    # Each expansion yields at most one value, so the memory cost that ordered
-    # `flat_map` warns about doesn't apply: it's `concurrency` values,
-    # whatever `buffer` says.
+    # Each expansion yields at most one value, so ordered mode holds at most
+    # `concurrency` values, regardless of `buffer`.
     return flat_map(expand, concurrency=concurrency, ordered=ordered)
 
 
@@ -426,8 +418,8 @@ def batch[T](size: int) -> Operator[T, list[T]]:
 
     async def apply(source: Source[T]) -> AsyncIterator[list[T]]:
         chunk: list[T] = []
-        # Owning `to_async_iter`'s wrapper instead of the raw source keeps the
-        # sync/async branching in one place, for the same single layer of cost.
+        # Own the wrapper to keep sync/async branching in `to_async_iter`,
+        # without adding another adapter.
         async with _OwnedAsync(
             to_async_iter(source), _Failures[Any](_Role.DIRECT)
         ) as items:
@@ -511,21 +503,19 @@ async def _map[T, U](
 ) -> AsyncIterator[U]:
     """The `map` driver: lazy, with a bound on in-flight calls.
 
-    At `concurrency=1` it runs sequentially, without scheduling tasks. Otherwise
-    a feeder task owns the source and starts one worker per item, while this
-    driver only reads finished results off a queue. Keeping the source off the
-    driver's await path is what lets a finished result go out while the source
-    is still busy producing the next item.
+    At `concurrency=1`, it runs sequentially without scheduling tasks.
+    Otherwise, a feeder owns the source and starts one worker per item.
+    The driver reads finished results from a queue, so a slow source can't hold
+    back ready output.
 
-    A slot, returned once its result is yielded, caps started-but-undelivered
-    work at `concurrency`, which gives the stage backpressure. That's also why
-    `ordered` needs no extra bound: at most `concurrency` finished results can
-    be waiting for their turn.
+    Slots provide backpressure: each is returned only after its result is yielded,
+    keeping started but undelivered work within `concurrency`. Ordered mode needs
+    no extra bound: at most `concurrency` results can be waiting for their turn.
     """
     if concurrency == 1:
-        # Ordering is built in here, so `ordered` must never move a stage off
-        # this path. The owner sees the whole body, so a failure from `fn`
-        # rightly outranks a failure from closing the source.
+        # Ordering is built in here, so `ordered` must not move a stage off this path.
+        # The owner sees the whole body, so an error from `fn` takes precedence
+        # over a source close error.
         async with _OwnedAsync(
             to_async_iter(source), _Failures[Any](_Role.DIRECT)
         ) as items:
@@ -539,8 +529,8 @@ async def _map[T, U](
     workers: set[asyncio.Task[None]] = set()
 
     async def run(seq: int, item: T) -> None:
-        # Every exit publishes exactly one message, cancellation included,
-        # so the driver's count of outstanding work can't strand it on `get`.
+        # Publish on every exit, cancellation included; otherwise the driver
+        # counts work that will never arrive and hangs on `get`.
         try:
             value = await _maybe_await(fn(item))
         except BaseException as exc:
@@ -575,8 +565,8 @@ async def _map[T, U](
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         finally:
-            # Reporting the count is what makes ending race-free: the driver
-            # never has to inspect a worker set that done callbacks change.
+            # A final count lets the driver detect completion without racing
+            # against done callbacks that change the worker set.
             results.put_nowait(_Fed(started, failure))
 
     started_total: int | None = None
@@ -598,8 +588,8 @@ async def _map[T, U](
                     if error is not None:
                         if not ordered or _bypasses_ordering(error):
                             raise error
-                        # Hold it until every started item is delivered: the
-                        # input ended here, so this is its position.
+                        # Hold it until every started item is delivered:
+                        # the input ended here, so this is its position.
                         source_failure = error
                 case _Value() | _Error() as result:
                     for ready in ordering.push(result, closes=True):
@@ -618,27 +608,23 @@ async def _flat_map[T, U](
 ) -> AsyncIterator[U]:
     """The `flat_map` driver: bounded concurrent expansions.
 
-    As in `_map`, a feeder task owns the source and starts one expansion task per
-    item, while this driver only reads from the queue, so a ready value can go
-    out while the source is still busy.
+    As in `_map`, a feeder owns the source and starts one expansion task per
+    item. The driver reads from the queue, so a slow source can't delay output.
 
-    Two semaphores do separate jobs. `slots` caps concurrent expansions.
-    `capacity`, returned after each value is yielded, caps unconsumed values,
-    so a slow consumer stalls production instead of letting expansions buffer.
+    Two semaphores do separate jobs: `slots` caps concurrent expansions,
+    and `capacity` caps buffered values. Capacity returns after a value is yielded,
+    so a slow consumer stalls production.
 
-    `ordered` changes both. A single shared `capacity` would deadlock:
-    an expansion that finishes early fills it with values waiting for their turn,
-    and the driver can't drain them until the in-turn expansion, now unable to
-    publish, finishes. So each expansion gets its own allowance, and one that's
-    out of turn parks against its own without blocking anybody. And a slot comes
-    back only once an expansion's values are *delivered*, not when it finishes:
-    undelivered values still take memory, so freeing the slot early would let
-    the feeder start another expansion and break the bound.
+    Ordered mode changes both. A shared `capacity` would deadlock:
+    an out-of-turn expansion could fill it while the current expansion still
+    needs room to publish. Each expansion therefore gets its own allowance.
+    Slots return only after an expansion's values are delivered, not when it
+    finishes; otherwise the feeder could start more expansions while their
+    output still takes memory.
 
-    The price is memory. Each expansion holds up to `buffer` published values,
-    plus one it has pulled while waiting for a permit, so an ordered stage holds
-    up to `concurrency * (buffer + 1)` values against `buffer + concurrency`
-    unordered.
+    Each expansion can hold `buffer` published values plus one pulled while
+    waiting for capacity. The ordered bound is `concurrency * (buffer + 1)`
+    values, compared with `buffer + concurrency` unordered.
     """
     queue: asyncio.Queue[_QueueItem[U]] = asyncio.Queue()
     source_failures = _Failures[U](_Role.RETAIN)
@@ -681,8 +667,8 @@ async def _flat_map[T, U](
             if isinstance(exc, asyncio.CancelledError) or _is_cancelling():
                 raise
         finally:
-            # Reporting the count is what makes ending race-free: the driver counts
-            # `_Done` messages instead of inspecting a task set that keeps changing.
+            # A final count lets the driver count `_Done` messages instead of
+            # inspecting a task set that done callbacks keep changing.
             queue.put_nowait(_Fed(started, failure))
 
     started_total: int | None = None
@@ -701,9 +687,8 @@ async def _flat_map[T, U](
             deliverable: Iterable[_Value[U] | _Error | _Done] = ()
             match await queue.get():
                 case _Value(value) if not ordered:
-                    # A deliberate fast path for the hot arm, like `map`'s
-                    # sequential route: the general path below would cost a
-                    # push, a tuple, and a re-dispatch per value.
+                    # Keep this fast path: the general path adds a push, a tuple,
+                    # and another dispatch per value.
                     yield value
                     # Returned only once the consumer takes the value, so a slow
                     # consumer holds capacity and throttles production.
@@ -724,23 +709,23 @@ async def _flat_map[T, U](
                     if error is not None:
                         if not ordered or _bypasses_ordering(error):
                             raise error
-                        # Hold it until every started expansion is drained: the
-                        # input ended here, so this is its position.
+                        # Hold it until every started expansion is drained:
+                        # the input ended here, so this is its position.
                         source_failure = error
 
             for message in deliverable:
                 match message:
                     case _Value(value, seq):
                         yield value
-                        # Returned only once the consumer takes the value, so a
-                        # slow consumer holds capacity and throttles production.
+                        # Returned only once the consumer takes the value,
+                        # so a slow consumer holds capacity and throttles production.
                         (capacities[seq] if ordered else shared_capacity).release()
                     case _Error(error):
                         raise error
                     case _Done(seq):
-                        # The whole expansion is delivered, so its allowance and
-                        # its slot go back together. Unordered, that's simply
-                        # when the expansion finished.
+                        # All values are delivered, so release the allowance and
+                        # slot together. In unordered mode, delivery is complete
+                        # as soon as the expansion finishes.
                         capacities.pop(seq, None)
                         slots.release()
 
@@ -756,7 +741,7 @@ async def _emit_expansion[T, U](
     capacity: asyncio.Semaphore,
     failures: _Failures[U],
 ) -> None:
-    """Run one expansion, publishing its values, or its error, to `queue`.
+    """Run one expansion, publishing its values or failure to `queue`.
 
     Each value takes a unit of `capacity`, so an expansion that gets ahead of the
     consumer blocks instead of buffering its whole output. A final `_Done` always
@@ -798,17 +783,14 @@ async def _emit_expansion[T, U](
 class _Ordered[M: _Positional]:
     """Replays positional messages in input order.
 
-    The queue delivers messages as they finish; this holds any that arrive before
-    their position's turn. `push` files a message under its position and returns
-    every message whose turn has come, in push order. A push with `closes`
-    retires its position once replayed, so the turn can advance: `map`'s single
-    result closes its own position, and `flat_map`'s `_Done` closes its
-    expansion's.
+    `push` buffers a message by input position and returns messages ready for
+    delivery, preserving arrival order within each position. With `closes=True`,
+    the position retires once replayed: a `map` result closes its own position,
+    and a `flat_map` `_Done` closes its expansion's position.
 
-    Delivery stays with the driver on purpose. Yielding to the consumer,
-    returning slots and capacity, and raising positional failures are the
-    driver's backpressure and teardown; a buffer that did them would own half of
-    every stage. Returning messages keeps this a plain data structure.
+    The driver still yields values, returns slots and capacity, and raises
+    failures. Those actions control backpressure and teardown; keeping them in
+    the driver leaves this as a plain data structure.
     """
 
     def __init__(self) -> None:
@@ -817,13 +799,13 @@ class _Ordered[M: _Positional]:
         self._turn = 0
 
     def push(self, message: M, *, closes: bool) -> Iterable[M]:
-        """File a message under its position, and return whatever is now in turn."""
+        """Buffer a message by position and return messages ready for delivery."""
         seq = message.seq
         self._waiting.setdefault(seq, []).append(message)
         if closes:
             self._closed.add(seq)
         if seq != self._turn:
-            # A message that's out of turn can't unblock the turn.
+            # A later position can't unblock the current one.
             return ()
         return self._replay()
 
@@ -839,9 +821,8 @@ class _Ordered[M: _Positional]:
 class _Unordered[M]:
     """Passes messages straight through: completion order is arrival order.
 
-    It's the no-op half of `_Ordered`'s contract, so each driver has one delivery
-    path and the mode is picked once, at construction, rather than checked in
-    every arm.
+    This shares `_Ordered`'s interface, so drivers choose a policy once rather
+    than branch on the mode for each message.
     """
 
     def push(self, message: M, *, closes: bool) -> tuple[M, ...]:
@@ -850,15 +831,13 @@ class _Unordered[M]:
 
 
 class _Stage:
-    """Supervises a concurrent stage's tasks, and decides its final failure.
+    """Supervises a concurrent stage's tasks and reports cleanup failures.
 
-    Wrap it around the driver loop, `yield` included. On exit it cancels
-    everything it supervises, waits for their cleanup, and then raises the first
-    recorded cleanup failure if the exit allows.
+    Wrap it around the driver loop, including `yield`. On exit, it cancels tasks,
+    waits for cleanup, and raises the first cleanup failure if allowed.
 
-    It closes no sources itself. Each owner closes what it owns when its own body
-    ends and reports through a `_Failures` record, which is why the tasks are
-    cancelled and awaited first.
+    It closes no sources itself. Iterator owners close them and report through
+    `_Failures`, so tasks must finish before teardown reads those records.
     """
 
     def __init__(
@@ -880,7 +859,7 @@ class _Stage:
     ) -> bool:
         failure: BaseException | None = None
         try:
-            # Feeder first, so its teardown failure is the one that wins, every time.
+            # Feeder first, so its teardown failure takes precedence.
             await _cancel_tasks([self._feeder, *self._tasks])
         except BaseException as exc:
             failure = exc
@@ -897,12 +876,11 @@ class _Stage:
 def _is_cancelling() -> bool:
     """Whether the running task has a cancellation pending.
 
-    Producer tasks use this to tell "I'm being torn down" from "what I was
-    reading raised". In the first case the driver has stopped reading,
-    so publishing the failure isn't enough; it must be re-raised too.
+    Producers distinguish task cancellation from an error raised by their input.
+    During teardown, the driver has stopped reading, so publishing a failure
+    isn't enough: the task must also re-raise it.
 
-    This is about a *task's* exception, not cleanup precedence, which is
-    `_may_surface`'s job.
+    This governs task exceptions; `_may_surface` handles cleanup precedence.
     """
     task = asyncio.current_task()
     return task is not None and bool(task.cancelling())
@@ -929,8 +907,8 @@ async def _cancel_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
 def _close(iterator: Iterator[Any]) -> None:
     """Close a sync iterator, if it has a `close` method.
 
-    An abandoned generator is otherwise left to the cyclic collector, because a
-    live traceback keeps its frame reachable; closing it here is deterministic.
+    An abandoned generator is otherwise left to the cyclic collector,
+    because a traceback keeps its frame reachable; closing it here is deterministic.
     Failures propagate, and the owner decides what to do with them.
     """
     close = getattr(iterator, "close", None)
@@ -942,8 +920,8 @@ async def _aclose(source: AsyncIterator[Any]) -> None:
     """Close an async iterator, if it has an `aclose` method.
 
     This lets stages release upstream generators promptly when the consumer
-    stops early or an error interrupts iteration. Failures propagate, and the
-    owner decides what to do with them.
+    stops early or an error interrupts iteration. Failures propagate,
+    and the owner decides what to do with them.
     """
     aclose = getattr(source, "aclose", None)
     if aclose is not None:

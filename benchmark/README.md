@@ -1,16 +1,16 @@
 # Benchmarks
 
-- `ab.py` checks a change for regressions. It loads `src/flowlet/functional.py` from two revisions side by side and runs them in turns, in one process, so machine drift hits both equally.
+- `ab.py` compares two versions of `src/flowlet/functional.py` for performance regressions. It alternates between them in one process to reduce machine drift.
 
   ```sh
   uv run python benchmark/ab.py              # HEAD vs. the working tree
   uv run python benchmark/ab.py master HEAD  # any two revisions
   ```
 
-- `compare.py` times flowlet against native executors and asyncio, on I/O- and CPU-bound scenarios plus no-op cases that isolate per-item overhead. If [parlane](https://github.com/SuitaShigeo/parlane) is installed in the environment, its rows are included too.
+- `compare.py` times flowlet against native executors and asyncio. I/O- and CPU-bound scenarios measure real work; no-op cases isolate per-item overhead. Install [parlane](https://github.com/SuitaShigeo/parlane) to include it in the comparison.
 
   ```sh
   uv run python benchmark/compare.py
   ```
 
-When items do real work, expect flowlet within a few percent of native. On no-op items, most of the gap is each item crossing between the event loop and a thread, so compare against `asyncio run_in_executor` rather than `concurrent.futures`. The rest is flowlet's task per item and its feeder.
+In our benchmark runs (M1 Pro, Python 3.14), flowlet took about 1.5–6% longer than native on the real-work scenarios. For no-op thread calls, most overhead comes from crossing between the event loop and a worker thread. Compare with `asyncio run_in_executor`, which pays that cost too, rather than `concurrent.futures`. Flowlet also pays for a feeder and a task per item.

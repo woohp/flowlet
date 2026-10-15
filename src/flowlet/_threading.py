@@ -31,10 +31,9 @@ def in_thread[**P, R](
 
 
 def _is_async_callable(fn: Callable[..., object]) -> bool:
-    """Whether `fn` is a coroutine or async-generator function.
+    """Whether `fn` is async, including callable objects and partials.
 
-    Looks through `functools.partial`,
-    so pre-binding arguments can't sneak an async function past the wrappers.
+    Unwrap `functools.partial` so binding arguments doesn't bypass the check.
     """
     candidate = cast(Any, fn)
     while isinstance(candidate, functools.partial):
@@ -80,8 +79,8 @@ class ThreadLocalResource[R]:
                 raise RuntimeError(
                     f"thread_local generator '{self._name}' did not yield"
                 ) from None
-            # Only thread-local storage holds the generator, so when the thread
-            # exits, the generator is finalized, which runs its cleanup.
+            # Thread-local storage keeps the generator alive until the thread
+            # exits, when finalization runs its cleanup.
             self._local.gen = gen
         else:
             value = cast(Callable[[], R], self._fn)()
@@ -105,12 +104,12 @@ def thread_local[R](fn: Callable[[], R]) -> ThreadLocalResource[R]: ...
 
 
 def thread_local[R](fn: Callable[[], Any]) -> ThreadLocalResource[R]:
-    """Create a lazily built resource, cached separately for each thread.
+    """Cache a resource on first use in each thread.
 
-    With a generator factory, the first value it yields is the resource.
-    The generator is never resumed;
-    it's closed by `close()` or when its thread exits.
-    A plain factory gets no cleanup.
+    A generator factory's first yielded value becomes the resource.
+    The generator is never resumed; `close()` or thread exit closes it and runs
+    its cleanup.
+    Plain factories have no cleanup.
     """
     return ThreadLocalResource(fn)
 

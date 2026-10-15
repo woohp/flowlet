@@ -2,10 +2,9 @@
 
     uv run python benchmark/compare.py [--rounds N]
 
-The sleep and math scenarios stand in for I/O- and CPU-bound work, and the no-op
-ones isolate per-item overhead. Each row is relative to the scenario's first,
-native row, and every implementation gets the same pool size. Rows for other
-libraries appear when those libraries are installed.
+Sleep and math simulate I/O- and CPU-bound work; no-op cases isolate per-item
+overhead. Times are relative to each scenario's first (native) row,
+with the same pool size for every implementation. Other libraries appear if installed.
 """
 
 import argparse
@@ -164,8 +163,8 @@ SCENARIOS: dict[str, dict[str, Callable[[], object]]] = {
     },
     "threads: 20k no-op": {
         "concurrent.futures": lambda: executor_map(threads, noop, TINY_ITEMS),
-        # The fair native baseline for an asyncio library. Each item crosses
-        # between the event loop and a worker thread, and that dominates here.
+        # A fairer baseline for an asyncio library: both pay for each item's
+        # round trip between the event loop and a worker thread.
         "asyncio run_in_executor": lambda: asyncio_executor(
             threads, noop, TINY_ITEMS, THREADS
         ),
