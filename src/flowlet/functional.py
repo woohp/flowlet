@@ -505,6 +505,7 @@ async def _map[T, U](
             results.put_nowait(_Value(value, seq))
 
     async def feed() -> None:
+        loop = asyncio.get_running_loop()
         started = 0
         failure: BaseException | None = None
         try:
@@ -515,7 +516,11 @@ async def _map[T, U](
                         item = await anext(items)
                     except StopAsyncIteration:
                         return
-                    task = asyncio.create_task(run(started, item))
+                    # Eager: work that finishes without suspending publishes in
+                    # this turn instead of costing the stage another event-loop
+                    # turn per item. Direct construction is the 3.13 spelling, so
+                    # these tasks bypass a custom task factory.
+                    task = asyncio.Task(run(started, item), loop=loop, eager_start=True)
                     workers.add(task)
                     task.add_done_callback(workers.discard)
                     started += 1
@@ -603,6 +608,7 @@ async def _flat_map[T, U](
     capacities: dict[int, asyncio.Semaphore] = {}
 
     async def feed() -> None:
+        loop = asyncio.get_running_loop()
         started = 0
         failure: BaseException | None = None
         try:
@@ -617,7 +623,12 @@ async def _flat_map[T, U](
                     if ordered:
                         capacity = asyncio.Semaphore(buffer)
                         capacities[started] = capacity
-                    task = asyncio.create_task(_emit_expansion(fn, item, started, queue, capacity, expansion_failures))
+                    # Eager, as in `_map`'s feeder.
+                    task = asyncio.Task(
+                        _emit_expansion(fn, item, started, queue, capacity, expansion_failures),
+                        loop=loop,
+                        eager_start=True,
+                    )
                     expansions.add(task)
                     task.add_done_callback(expansions.discard)
                     started += 1
