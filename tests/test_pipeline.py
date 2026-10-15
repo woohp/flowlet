@@ -1068,6 +1068,41 @@ class TestSourcesAndTerminals:
     @pytest.mark.parametrize(
         "build",
         [
+            pytest.param(lambda source, work: pipe(source).map(work, concurrency=4), id="map"),
+            pytest.param(lambda source, work: pipe(source).flat_map(work, concurrency=4), id="flat_map"),
+        ],
+    )
+    async def test_source_cleanup_failure_outranks_worker_cleanup_failures(self, build: Any) -> None:
+        async def source() -> AsyncIterator[int]:
+            yield 0
+            yield 1
+            yield 2
+            try:
+                await asyncio.Event().wait()
+            finally:
+                raise ValueError("source cleanup boom")
+
+        async def work(x: int) -> list[int]:
+            if x > 0:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    raise RuntimeError("worker cleanup boom")
+            return [x]
+
+        stream = build(source(), work).__aiter__()
+        await anext(stream)
+        await settle()
+
+        # Teardown cancels the feeder first, so when the source and the workers
+        # all fail to clean up, the source's failure is the one reported, every time.
+        with pytest.raises(ValueError, match="source cleanup boom"):
+            await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
             # Only the concurrent drivers read ahead, so only they can exhaust the
             # source before the consumer abandons. The sequential paths are lazy and
             # are covered by test_source_cleanup_failure_is_reported_by_close.
