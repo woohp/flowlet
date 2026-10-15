@@ -8,10 +8,9 @@ from flowlet.functional import Expander, Operator, Predicate, Source
 
 @dataclass(frozen=True)
 class Flow[T, U = T]:
-    """Reusable, sourceless pipeline fragment.
+    """A reusable pipeline fragment that has no source yet.
 
-    A `Flow` stores one or more lazy stream transforms and can be applied to a
-    source with `pipe(...).through(flow)` or composed with another flow using `|`.
+    Apply it with `pipe(source).through(flow)`, or chain flows with `|`.
     """
 
     _operators: tuple[Operator[Any, Any], ...] = ()
@@ -41,13 +40,15 @@ class Flow[T, U = T]:
         concurrency: int = 1,
         ordered: bool = False,
     ) -> Flow[T, V]:
-        """Return a flow that applies `fn` to each item.
+        """Apply `fn` to each item.
 
-        `fn` may be sync or async. When `concurrency` is greater than one,
-        results are emitted as calls complete rather than in input order, unless
-        `ordered` restores input order at the cost of holding early results.
+        `fn` can be sync or async. With `concurrency` above one, results come out
+        as calls finish rather than in input order;
+        `ordered=True` keeps input order by holding back early results.
         """
-        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency, ordered=ordered))
+        return self | Flow._from_operator(
+            functional.map(fn, concurrency=concurrency, ordered=ordered)
+        )
 
     def flat_map[V](
         self,
@@ -57,17 +58,19 @@ class Flow[T, U = T]:
         buffer: int = functional.DEFAULT_BUFFER,
         ordered: bool = False,
     ) -> Flow[T, V]:
-        """Return a flow that expands each item into zero or more outputs.
+        """Expand each item into zero or more items.
 
-        `fn` may return an iterable, async iterable, or an awaitable resolving to
-        either. Outputs from concurrent expansions are emitted as they arrive.
+        `fn` can return an iterable, an async iterable, or an awaitable of either.
+        Concurrent expansions interleave their values as they arrive.
 
-        `buffer` caps how many expanded values may wait for the consumer before
-        expansions pause. `ordered` groups the output by input item instead, and
-        holds up to `concurrency * (buffer + 1)` values rather than
-        `buffer + concurrency`.
+        `buffer` caps how many values can wait for the consumer before expansions
+        pause. `ordered=True` keeps each item's values together, in input order,
+        and can hold up to `concurrency * (buffer + 1)` values
+        instead of `buffer + concurrency`.
         """
-        operator = functional.flat_map(fn, concurrency=concurrency, buffer=buffer, ordered=ordered)
+        operator = functional.flat_map(
+            fn, concurrency=concurrency, buffer=buffer, ordered=ordered
+        )
         return self | Flow._from_operator(operator)
 
     def filter(
@@ -77,27 +80,29 @@ class Flow[T, U = T]:
         concurrency: int = 1,
         ordered: bool = False,
     ) -> Flow[T, U]:
-        """Return a flow that keeps items where `pred` returns true.
+        """Keep the items `pred` accepts.
 
-        `pred` may be sync or async. With concurrent predicates, kept items are
-        emitted in completion order, or in input order when `ordered` is set.
+        `pred` can be sync or async. Concurrent predicates emit kept items as they
+        finish, or in input order with `ordered=True`.
         """
-        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency, ordered=ordered))
+        return self | Flow._from_operator(
+            functional.filter(pred, concurrency=concurrency, ordered=ordered)
+        )
 
     def batch(self, size: int) -> Flow[T, list[U]]:
-        """Return a flow that collects items into lists of up to `size`."""
+        """Group items into lists of up to `size`."""
         return self | Flow._from_operator(functional.batch(size))
 
     def apply(self, source: Source[T]) -> AsyncIterator[U]:
-        """Apply this flow to a source and return an async iterator."""
+        """Run this flow over `source`."""
         return functional.chain(*self._operators)(source)
 
     def through[V](self, flow: Flow[U, V]) -> Flow[T, V]:
-        """Return a new flow with `flow` appended after this one."""
+        """Append the steps of `flow`."""
         return Flow((*self._operators, *flow._operators))
 
     def __or__[V](self, flow: Flow[U, V]) -> Flow[T, V]:
-        """Compose two flows using `left | right` syntax."""
+        """`left | right` is `left.through(right)`."""
         return self.through(flow)
 
     @staticmethod
@@ -107,10 +112,10 @@ class Flow[T, U = T]:
 
 @dataclass(frozen=True)
 class Pipeline[T]:
-    """Lazy async pipeline bound to a source.
+    """A lazy async pipeline bound to a source.
 
-    Pipeline methods return new pipelines; execution starts only when the
-    pipeline is iterated or consumed with a terminal method.
+    Each method returns a new pipeline. Nothing runs until you iterate it
+    or call a terminal method such as `collect()`.
     """
 
     _source: Source[Any]
@@ -141,13 +146,15 @@ class Pipeline[T]:
         concurrency: int = 1,
         ordered: bool = False,
     ) -> Pipeline[U]:
-        """Return a pipeline that applies `fn` to each item.
+        """Apply `fn` to each item.
 
-        `fn` may be sync or async. When `concurrency` is greater than one,
-        results are emitted as calls complete rather than in input order, unless
-        `ordered` restores input order at the cost of holding early results.
+        `fn` can be sync or async. With `concurrency` above one, results come out
+        as calls finish rather than in input order;
+        `ordered=True` keeps input order by holding back early results.
         """
-        return self | Flow._from_operator(functional.map(fn, concurrency=concurrency, ordered=ordered))
+        return self | Flow._from_operator(
+            functional.map(fn, concurrency=concurrency, ordered=ordered)
+        )
 
     def flat_map[U](
         self,
@@ -157,17 +164,19 @@ class Pipeline[T]:
         buffer: int = functional.DEFAULT_BUFFER,
         ordered: bool = False,
     ) -> Pipeline[U]:
-        """Return a pipeline that expands each item into zero or more outputs.
+        """Expand each item into zero or more items.
 
-        `fn` may return an iterable, async iterable, or an awaitable resolving to
-        either. Outputs from concurrent expansions are emitted as they arrive.
+        `fn` can return an iterable, an async iterable, or an awaitable of either.
+        Concurrent expansions interleave their values as they arrive.
 
-        `buffer` caps how many expanded values may wait for the consumer before
-        expansions pause. `ordered` groups the output by input item instead, and
-        holds up to `concurrency * (buffer + 1)` values rather than
-        `buffer + concurrency`.
+        `buffer` caps how many values can wait for the consumer before expansions
+        pause. `ordered=True` keeps each item's values together, in input order,
+        and can hold up to `concurrency * (buffer + 1)` values
+        instead of `buffer + concurrency`.
         """
-        operator = functional.flat_map(fn, concurrency=concurrency, buffer=buffer, ordered=ordered)
+        operator = functional.flat_map(
+            fn, concurrency=concurrency, buffer=buffer, ordered=ordered
+        )
         return self | Flow._from_operator(operator)
 
     def filter(
@@ -177,40 +186,42 @@ class Pipeline[T]:
         concurrency: int = 1,
         ordered: bool = False,
     ) -> Pipeline[T]:
-        """Return a pipeline that keeps items where `pred` returns true.
+        """Keep the items `pred` accepts.
 
-        `pred` may be sync or async. With concurrent predicates, kept items are
-        emitted in completion order, or in input order when `ordered` is set.
+        `pred` can be sync or async. Concurrent predicates emit kept items as they
+        finish, or in input order with `ordered=True`.
         """
-        return self | Flow._from_operator(functional.filter(pred, concurrency=concurrency, ordered=ordered))
+        return self | Flow._from_operator(
+            functional.filter(pred, concurrency=concurrency, ordered=ordered)
+        )
 
     def batch(self, size: int) -> Pipeline[list[T]]:
-        """Return a pipeline that collects items into lists of up to `size`."""
+        """Group items into lists of up to `size`."""
         return self | Flow._from_operator(functional.batch(size))
 
     def __aiter__(self) -> AsyncIterator[T]:
-        """Iterate over the pipeline results asynchronously."""
+        """Iterate over the results."""
         return functional.chain(*self._operators)(self._source)
 
     async def collect(self) -> list[T]:
-        """Consume the pipeline and return all results as a list."""
+        """Run the pipeline and return every result in a list."""
         return await functional.collect(self)
 
     async def drain(self) -> None:
-        """Consume the pipeline, discarding any yielded values."""
+        """Run the pipeline for its side effects, discarding the results."""
         await functional.drain(self)
 
     def through[U](self, flow: Flow[T, U]) -> Pipeline[U]:
-        """Return a new pipeline with `flow` appended after current steps."""
+        """Append the steps of `flow`."""
         return Pipeline(self._source, (*self._operators, *flow._operators))
 
     def __or__[U](self, flow: Flow[T, U]) -> Pipeline[U]:
-        """Append a flow using `pipeline | flow` syntax."""
+        """`pipeline | flow` is `pipeline.through(flow)`."""
         return self.through(flow)
 
 
 def pipe[T](source: Source[T]) -> Pipeline[T]:
-    """Create a lazy pipeline from an iterable or async iterable source."""
+    """Start a lazy pipeline from an iterable or async iterable."""
     return Pipeline(source)
 
 

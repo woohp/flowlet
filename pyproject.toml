@@ -15,10 +15,6 @@ build-backend = "uv_build"
 minversion = "6.0"
 addopts = "-s"
 
-[tool.ruff]
-line-length = 120
-indent-width = 4
-
 [tool.ruff.lint]
 select = [
     "A",

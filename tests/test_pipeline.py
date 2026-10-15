@@ -41,10 +41,10 @@ def process_expand(x: int) -> list[int]:
 async def settle(turns: int = 20) -> None:
     """Give a parked feeder every chance to start more work than it should.
 
-    Event-driven rather than a wall-clock sleep: waking on a released slot, pulling
-    the next item, and running the new task take a handful of event-loop turns, so
-    yielding a bounded number of times proves the feeder is blocked without making
-    the assertion depend on machine speed.
+    This yields a fixed number of event-loop turns instead of sleeping. Waking on
+    a released slot, pulling the next item, and running the new task take only a
+    few turns, so this proves the feeder is blocked without depending on machine
+    speed.
     """
     for _ in range(turns):
         await asyncio.sleep(0)
@@ -90,7 +90,9 @@ class TestPipelineApi:
 class TestCardinality:
     @pytest.mark.asyncio
     async def test_filter_keeps_matching_items(self) -> None:
-        result: list[int] = await pipe([1, 2, 3, 4]).filter(lambda x: x % 2 == 0).collect()
+        result: list[int] = (
+            await pipe([1, 2, 3, 4]).filter(lambda x: x % 2 == 0).collect()
+        )
 
         assert result == [2, 4]
 
@@ -155,7 +157,9 @@ class TestCardinality:
 class TestConcurrency:
     @pytest.mark.asyncio
     async def test_large_input_does_not_deadlock(self) -> None:
-        result: list[int] = await asyncio.wait_for(pipe(range(100)).map(double, concurrency=10).collect(), timeout=1)
+        result: list[int] = await asyncio.wait_for(
+            pipe(range(100)).map(double, concurrency=10).collect(), timeout=1
+        )
 
         assert sorted(result) == [x * 2 for x in range(100)]
 
@@ -165,7 +169,9 @@ class TestConcurrency:
             await asyncio.sleep((3 - x) * 0.01)
             return x
 
-        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3).collect()
+        result: list[int] = (
+            await pipe([1, 2, 3]).map(slow_inverse, concurrency=3).collect()
+        )
 
         assert result == [3, 2, 1]
 
@@ -175,7 +181,9 @@ class TestConcurrency:
             await asyncio.sleep((3 - x) * 0.01)
             return [x]
 
-        result: list[int] = await pipe([1, 2, 3]).flat_map(expand, concurrency=3).collect()
+        result: list[int] = (
+            await pipe([1, 2, 3]).flat_map(expand, concurrency=3).collect()
+        )
 
         assert result == [3, 2, 1]
 
@@ -185,7 +193,9 @@ class TestConcurrency:
             await asyncio.sleep((3 - x) * 0.01)
             return True
 
-        result: list[int] = await pipe([1, 2, 3]).filter(slow_keep, concurrency=3).collect()
+        result: list[int] = (
+            await pipe([1, 2, 3]).filter(slow_keep, concurrency=3).collect()
+        )
 
         assert result == [3, 2, 1]
 
@@ -196,12 +206,16 @@ class TestConcurrency:
                 return list(range(20))
             return [x]
 
-        result = await asyncio.wait_for(pipe([1, 2, 3, 4]).flat_map(expand, concurrency=4).collect(), timeout=1)
+        result = await asyncio.wait_for(
+            pipe([1, 2, 3, 4]).flat_map(expand, concurrency=4).collect(), timeout=1
+        )
 
         assert sorted(result) == [0, 1, 2, 2, 3, 3, 4, *range(4, 20)]
 
     @pytest.mark.asyncio
-    async def test_flat_map_supports_concurrent_async_generator_expansions(self) -> None:
+    async def test_flat_map_supports_concurrent_async_generator_expansions(
+        self,
+    ) -> None:
         async def expand(x: int) -> AsyncIterator[int]:
             await asyncio.sleep((3 - x) * 0.01)
             yield x
@@ -221,7 +235,12 @@ class TestConcurrency:
             await asyncio.sleep(0)
             return x * 10
 
-        result = await pipe([1, 2, 3]).map(first, concurrency=3).map(second, concurrency=2).collect()
+        result = (
+            await pipe([1, 2, 3])
+            .map(first, concurrency=3)
+            .map(second, concurrency=2)
+            .collect()
+        )
 
         assert sorted(result) == [20, 30, 40]
 
@@ -257,8 +276,8 @@ class TestConcurrency:
         stream = pipe([1, 2]).flat_map(expand, concurrency=2, buffer=32).__aiter__()
         try:
             await anext(stream)
-            # The consumer stalls holding one value; expansions must park once
-            # they fill the buffer rather than draining their whole output.
+            # The consumer stalls while holding one value. Expansions must park once
+            # they fill the buffer, not drain their whole output.
             await asyncio.sleep(0.05)
 
             assert produced <= 48, f"ran {produced} values ahead of a stalled consumer"
@@ -266,7 +285,9 @@ class TestConcurrency:
             await cast(Any, stream).aclose()
 
     @pytest.mark.asyncio
-    async def test_flat_map_stays_bounded_across_sustained_slow_consumption(self) -> None:
+    async def test_flat_map_stays_bounded_across_sustained_slow_consumption(
+        self,
+    ) -> None:
         produced = 0
 
         async def expand(x: int) -> AsyncIterator[int]:
@@ -286,13 +307,18 @@ class TestConcurrency:
         assert produced <= consumed + 48, f"produced {produced} for {consumed} consumed"
 
     @pytest.mark.asyncio
-    async def test_flat_map_buffer_smaller_than_concurrency_still_completes(self) -> None:
+    async def test_flat_map_buffer_smaller_than_concurrency_still_completes(
+        self,
+    ) -> None:
         async def expand(x: int) -> AsyncIterator[int]:
             for i in range(20):
                 yield i
                 await asyncio.sleep(0)
 
-        result = await asyncio.wait_for(pipe(range(8)).flat_map(expand, concurrency=8, buffer=1).collect(), timeout=5)
+        result = await asyncio.wait_for(
+            pipe(range(8)).flat_map(expand, concurrency=8, buffer=1).collect(),
+            timeout=5,
+        )
 
         assert sorted(result) == sorted(list(range(20)) * 8)
 
@@ -310,7 +336,9 @@ class TestConcurrency:
         async def runahead(buffer: int) -> int:
             counter = [0]
             expand = await counting_expansion(counter)
-            stream = pipe([1]).flat_map(expand, concurrency=1, buffer=buffer).__aiter__()
+            stream = (
+                pipe([1]).flat_map(expand, concurrency=1, buffer=buffer).__aiter__()
+            )
             try:
                 await anext(stream)
                 await asyncio.sleep(0.02)
@@ -331,8 +359,8 @@ class TestConcurrency:
             for i in range(10_000):
                 yield i
 
-        # Expansions are parked waiting for capacity when the consumer leaves;
-        # cancelling them must not deadlock on the backpressure credit.
+        # The consumer leaves while expansions are parked waiting for capacity;
+        # cancelling them mustn't deadlock on the backpressure credit.
         async def run() -> None:
             async for _ in pipe(range(20)).flat_map(expand, concurrency=4):
                 break
@@ -346,7 +374,9 @@ class TestConcurrency:
                 yield i
                 await asyncio.sleep(0)
 
-        result = await asyncio.wait_for(pipe(range(6)).flat_map(expand, concurrency=3).collect(), timeout=5)
+        result = await asyncio.wait_for(
+            pipe(range(6)).flat_map(expand, concurrency=3).collect(), timeout=5
+        )
 
         assert len(result) == 3000
         assert sorted(result) == sorted(list(range(500)) * 6)
@@ -359,8 +389,8 @@ class TestConcurrency:
 
         stream = pipe(source()).map(double, concurrency=2).__aiter__()
         try:
-            # The result for item 1 is ready; a stage must not sit on it just
-            # because the source has not produced a second item yet.
+            # Item 1's result is ready, and the stage mustn't sit on it just
+            # because the source hasn't produced a second item yet.
             assert await asyncio.wait_for(anext(stream), timeout=0.5) == 2
         finally:
             await cast(Any, stream).aclose()
@@ -390,7 +420,9 @@ class TestConcurrency:
             await cast(Any, stream).aclose()
 
     @pytest.mark.asyncio
-    async def test_map_emits_every_ready_result_while_the_source_is_blocked(self) -> None:
+    async def test_map_emits_every_ready_result_while_the_source_is_blocked(
+        self,
+    ) -> None:
         async def source() -> AsyncIterator[int]:
             for value in (1, 2, 3):
                 yield value
@@ -412,7 +444,12 @@ class TestConcurrency:
             yield 1
             await asyncio.Event().wait()
 
-        stream = pipe(source()).map(double, concurrency=2).map(add_one, concurrency=2).__aiter__()
+        stream = (
+            pipe(source())
+            .map(double, concurrency=2)
+            .map(add_one, concurrency=2)
+            .__aiter__()
+        )
         try:
             assert await asyncio.wait_for(anext(stream), timeout=0.5) == 3
         finally:
@@ -420,13 +457,15 @@ class TestConcurrency:
 
     @pytest.mark.asyncio
     async def test_concurrent_map_worker_cancelled_error_propagates(self) -> None:
-        # The driver counts outstanding work rather than awaiting each task, so a
-        # worker that fails must publish its failure or the driver would hang.
+        # The driver counts outstanding work instead of awaiting each task,
+        # so a failing worker must publish its failure, or the driver would hang.
         async def cancel(_: int) -> int:
             raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(pipe([1, 2, 3]).map(cancel, concurrency=2).collect(), timeout=1)
+            await asyncio.wait_for(
+                pipe([1, 2, 3]).map(cancel, concurrency=2).collect(), timeout=1
+            )
 
     @pytest.mark.asyncio
     async def test_concurrent_map_worker_base_exception_propagates(self) -> None:
@@ -437,7 +476,9 @@ class TestConcurrency:
             raise StopNow
 
         with pytest.raises(StopNow):
-            await asyncio.wait_for(pipe([1, 2, 3]).map(stop, concurrency=2).collect(), timeout=1)
+            await asyncio.wait_for(
+                pipe([1, 2, 3]).map(stop, concurrency=2).collect(), timeout=1
+            )
 
     @pytest.mark.asyncio
     async def test_invalid_concurrency_raises(self) -> None:
@@ -446,11 +487,11 @@ class TestConcurrency:
 
 
 class TestOrderedMap:
-    """`ordered=True` must reproduce what `concurrency=1` would have produced.
+    """`ordered=True` must produce exactly what `concurrency=1` would.
 
-    Same values, same order, any ordinary failure at the same point -- only the
+    Same values, same order, and any ordinary failure at the same point; only the
     timing differs. Each case here pins one consequence of taking that literally.
-    Cancellation is the deliberate exception, in `TestOrderedCancellation`.
+    Cancellation is the deliberate exception, covered in `TestOrderedCancellation`.
     """
 
     @pytest.mark.asyncio
@@ -459,7 +500,11 @@ class TestOrderedMap:
             await asyncio.sleep((3 - x) * 0.01)
             return x
 
-        result: list[int] = await pipe([1, 2, 3]).map(slow_inverse, concurrency=3, ordered=True).collect()
+        result: list[int] = (
+            await pipe([1, 2, 3])
+            .map(slow_inverse, concurrency=3, ordered=True)
+            .collect()
+        )
 
         assert result == [1, 2, 3]
 
@@ -473,7 +518,11 @@ class TestOrderedMap:
             return x * 10
 
         sequential = await pipe(range(len(delays))).map(work, concurrency=1).collect()
-        ordered = await pipe(range(len(delays))).map(work, concurrency=4, ordered=True).collect()
+        ordered = (
+            await pipe(range(len(delays)))
+            .map(work, concurrency=4, ordered=True)
+            .collect()
+        )
         unordered = await pipe(range(len(delays))).map(work, concurrency=4).collect()
 
         assert ordered == sequential
@@ -481,9 +530,9 @@ class TestOrderedMap:
 
     @pytest.mark.asyncio
     async def test_ordered_at_concurrency_one_stays_sequential(self) -> None:
-        # Ordering is inherent at concurrency=1, so asking for it must not cost the
-        # sequential path its fast route. `fn` running in the consumer's own task is
-        # the observable difference: the concurrent driver runs it in a worker.
+        # Ordering is built in at concurrency=1, so asking for it mustn't cost
+        # the sequential path its fast route. The visible difference: there, `fn`
+        # runs in the consumer's own task, while the concurrent driver uses a worker.
         seen: list[asyncio.Task[Any] | None] = []
 
         async def record(x: int) -> int:
@@ -491,7 +540,9 @@ class TestOrderedMap:
             return x
 
         async def run() -> list[int]:
-            return await pipe([1, 2, 3]).map(record, concurrency=1, ordered=True).collect()
+            return (
+                await pipe([1, 2, 3]).map(record, concurrency=1, ordered=True).collect()
+            )
 
         task = asyncio.create_task(run())
 
@@ -511,7 +562,7 @@ class TestOrderedMap:
             async for value in pipe([0, 1, 2]).map(work, concurrency=3, ordered=True):
                 got.append(value)
 
-        # Item 2 finished long before item 1 failed, and is still not delivered:
+        # Item 2 finished long before item 1 failed, and still isn't delivered:
         # a failure at position 1 ends the stream there.
         assert got == [0]
 
@@ -531,15 +582,15 @@ class TestOrderedMap:
             async for value in pipe(source()).map(work, concurrency=4, ordered=True):
                 got.append(value)
 
-        # The source failed while producing item 2, so it belongs after items 0
-        # and 1 -- even though it was known before either had finished.
+        # The source failed while producing item 2, so the failure belongs after
+        # items 0 and 1, even though it was known before either finished.
         assert got == [0, 1]
 
     @pytest.mark.asyncio
     async def test_an_item_failure_outranks_a_held_source_failure(self) -> None:
-        # Sequentially, item 1's failure means the source is never pulled past it,
-        # so the source failure never happens. The ordered stage reproduces that:
-        # the held source failure is dropped when an item's turn raises first.
+        # Run sequentially, item 1's failure means the source is never pulled past
+        # it, so the source failure never happens. The ordered stage matches that
+        # by dropping the held source failure when an item's turn raises first.
         async def source() -> AsyncIterator[int]:
             yield 0
             yield 1
@@ -560,8 +611,8 @@ class TestOrderedMap:
 
     @pytest.mark.asyncio
     async def test_holds_at_most_concurrency_results(self) -> None:
-        # A slot is not returned until its result is delivered, so waiting for a
-        # turn cannot let the stage run ahead: this is why ordered mode needs no
+        # A slot isn't returned until its result is delivered, so waiting for a
+        # turn can't let the stage run ahead. That's why ordered mode needs no
         # buffer bound of its own.
         release = asyncio.Event()
         all_slots_used = asyncio.Event()
@@ -597,8 +648,12 @@ class TestOrderedMap:
             await asyncio.sleep((3 - x) * 0.01)
             return x
 
-        via_op = await (pipe([1, 2, 3]) | op.map(slow_inverse, concurrency=3, ordered=True)).collect()
-        via_flow = await (pipe([1, 2, 3]) | Flow[int]().map(slow_inverse, concurrency=3, ordered=True)).collect()
+        via_op = await (
+            pipe([1, 2, 3]) | op.map(slow_inverse, concurrency=3, ordered=True)
+        ).collect()
+        via_flow = await (
+            pipe([1, 2, 3]) | Flow[int]().map(slow_inverse, concurrency=3, ordered=True)
+        ).collect()
 
         assert via_op == [1, 2, 3]
         assert via_flow == [1, 2, 3]
@@ -613,7 +668,11 @@ class TestOrderedFlatMap:
             await asyncio.sleep((3 - x) * 0.01)
             return [x, x * 10]
 
-        result = await pipe([1, 2, 3]).flat_map(expand, concurrency=3, ordered=True).collect()
+        result = (
+            await pipe([1, 2, 3])
+            .flat_map(expand, concurrency=3, ordered=True)
+            .collect()
+        )
 
         assert result == [1, 10, 2, 20, 3, 30]
 
@@ -625,19 +684,27 @@ class TestOrderedFlatMap:
             await asyncio.sleep(delays[x])
             return [x, -x]
 
-        sequential = await pipe(range(len(delays))).flat_map(expand, concurrency=1).collect()
-        ordered = await pipe(range(len(delays))).flat_map(expand, concurrency=4, ordered=True).collect()
-        unordered = await pipe(range(len(delays))).flat_map(expand, concurrency=4).collect()
+        sequential = (
+            await pipe(range(len(delays))).flat_map(expand, concurrency=1).collect()
+        )
+        ordered = (
+            await pipe(range(len(delays)))
+            .flat_map(expand, concurrency=4, ordered=True)
+            .collect()
+        )
+        unordered = (
+            await pipe(range(len(delays))).flat_map(expand, concurrency=4).collect()
+        )
 
         assert ordered == sequential
         assert unordered != sequential, "the delays no longer reorder anything"
 
     @pytest.mark.asyncio
     async def test_out_of_turn_expansion_cannot_stall_the_stage(self) -> None:
-        # One shared value allowance deadlocks here, which is why each expansion
-        # gets its own: expansion 1 finishes at once and fills the allowance with
-        # values that cannot be delivered until expansion 0's turn ends, while
-        # expansion 0 has more to publish than one allowance holds.
+        # This is where one shared value allowance deadlocks, and why each
+        # expansion gets its own. Expansion 1 finishes at once and fills the
+        # allowance with values that can't go out until expansion 0's turn ends,
+        # while expansion 0 has more to publish than one allowance holds.
         async def expand(x: int) -> AsyncIterator[int]:
             for i in range(12):
                 if x == 0:
@@ -651,10 +718,10 @@ class TestOrderedFlatMap:
 
     @pytest.mark.asyncio
     async def test_holds_at_most_concurrency_expansions(self) -> None:
-        # A slot is returned when an expansion's values have been *delivered*, not
-        # when it terminates: an expansion holding undelivered values still holds
-        # memory, so releasing early would let the feeder start another and hold
-        # more than `concurrency * (buffer + 1)` values.
+        # A slot comes back once an expansion's values are *delivered*, not when
+        # it finishes. Undelivered values still take memory, so freeing the slot
+        # early would let the feeder start another expansion and hold more than
+        # `concurrency * (buffer + 1)` values.
         release = asyncio.Event()
         all_slots_used = asyncio.Event()
         started = 0
@@ -668,7 +735,9 @@ class TestOrderedFlatMap:
                 await release.wait()
             return [x]
 
-        stream = pipe(range(100)).flat_map(expand, concurrency=2, ordered=True).__aiter__()
+        stream = (
+            pipe(range(100)).flat_map(expand, concurrency=2, ordered=True).__aiter__()
+        )
 
         async def take_first() -> int:
             return await anext(stream)
@@ -693,13 +762,17 @@ class TestOrderedFlatMap:
 
         got: list[int] = []
         with pytest.raises(RuntimeError, match="boom"):
-            async for value in pipe([0, 1, 2]).flat_map(expand, concurrency=3, ordered=True):
+            async for value in pipe([0, 1, 2]).flat_map(
+                expand, concurrency=3, ordered=True
+            ):
                 got.append(value)
 
         assert got == [0]
 
     @pytest.mark.asyncio
-    async def test_values_before_a_failure_in_the_same_expansion_arrive_first(self) -> None:
+    async def test_values_before_a_failure_in_the_same_expansion_arrive_first(
+        self,
+    ) -> None:
         async def expand(x: int) -> AsyncIterator[int]:
             yield x
             if x == 1:
@@ -707,7 +780,9 @@ class TestOrderedFlatMap:
 
         got: list[int] = []
         with pytest.raises(RuntimeError, match="boom"):
-            async for value in pipe([0, 1, 2]).flat_map(expand, concurrency=3, ordered=True):
+            async for value in pipe([0, 1, 2]).flat_map(
+                expand, concurrency=3, ordered=True
+            ):
                 got.append(value)
 
         assert got == [0, 1]
@@ -725,17 +800,19 @@ class TestOrderedFlatMap:
 
         got: list[int] = []
         with pytest.raises(RuntimeError, match="source boom"):
-            async for value in pipe(source()).flat_map(expand, concurrency=4, ordered=True):
+            async for value in pipe(source()).flat_map(
+                expand, concurrency=4, ordered=True
+            ):
                 got.append(value)
 
-        # The source failed while producing the third item, so it belongs after
-        # both started expansions -- even though it was known before either had
-        # finished.
+        # The source failed while producing the third item, so the failure
+        # belongs after both started expansions, even though it was known before
+        # either finished.
         assert got == [1, 10, 2, 20]
 
     @pytest.mark.asyncio
     async def test_an_expansion_failure_outranks_a_held_source_failure(self) -> None:
-        # The sequential-equivalence argument from the `map` twin, applied to the
+        # The same sequential argument as the `map` version, applied to the
         # drain loop: a positional failure raises before the held source failure.
         async def source() -> AsyncIterator[int]:
             yield 0
@@ -750,7 +827,9 @@ class TestOrderedFlatMap:
 
         got: list[int] = []
         with pytest.raises(ValueError, match="expansion boom"):
-            async for value in pipe(source()).flat_map(expand, concurrency=4, ordered=True):
+            async for value in pipe(source()).flat_map(
+                expand, concurrency=4, ordered=True
+            ):
                 got.append(value)
 
         assert got == [0]
@@ -761,7 +840,11 @@ class TestOrderedFlatMap:
             await asyncio.sleep((3 - x) * 0.01)
             return x != 2
 
-        result = await pipe([1, 2, 3]).filter(slow_keep, concurrency=3, ordered=True).collect()
+        result = (
+            await pipe([1, 2, 3])
+            .filter(slow_keep, concurrency=3, ordered=True)
+            .collect()
+        )
 
         assert result == [1, 3]
 
@@ -771,9 +854,15 @@ class TestOrderedFlatMap:
             await asyncio.sleep((3 - x) * 0.01)
             return [x]
 
-        via_op = await (pipe([1, 2, 3]) | op.flat_map(expand, concurrency=3, ordered=True)).collect()
-        via_flow = await (pipe([1, 2, 3]) | Flow[int]().flat_map(expand, concurrency=3, ordered=True)).collect()
-        filtered = await (pipe([1, 2, 3]) | op.filter(lambda x: True, concurrency=3, ordered=True)).collect()
+        via_op = await (
+            pipe([1, 2, 3]) | op.flat_map(expand, concurrency=3, ordered=True)
+        ).collect()
+        via_flow = await (
+            pipe([1, 2, 3]) | Flow[int]().flat_map(expand, concurrency=3, ordered=True)
+        ).collect()
+        filtered = await (
+            pipe([1, 2, 3]) | op.filter(lambda x: True, concurrency=3, ordered=True)
+        ).collect()
 
         assert via_op == [1, 2, 3]
         assert via_flow == [1, 2, 3]
@@ -781,12 +870,12 @@ class TestOrderedFlatMap:
 
 
 class TestOrderedCancellation:
-    """Cancellation is not a result to be ordered, so it never waits for a turn.
+    """Cancellation isn't a result to put in order, so it never waits for a turn.
 
-    Each case parks item 0 on an event that is never set, so an implementation
-    that treats cancellation as an ordinary positional failure hangs instead of
-    reporting -- and `wait_for` turns that hang into a `TimeoutError`, which is
-    a different exception than the one asserted.
+    Each case parks item 0 on an event that's never set. An implementation that
+    treats cancellation as an ordinary positional failure hangs instead of
+    reporting, and `wait_for` turns that hang into a `TimeoutError`, which isn't
+    the exception the test expects.
     """
 
     @pytest.mark.asyncio
@@ -799,26 +888,35 @@ class TestOrderedCancellation:
             raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(pipe([0, 1]).map(work, concurrency=2, ordered=True).collect(), timeout=1)
+            await asyncio.wait_for(
+                pipe([0, 1]).map(work, concurrency=2, ordered=True).collect(), timeout=1
+            )
 
     @pytest.mark.asyncio
-    async def test_an_expansion_cancellation_does_not_wait_for_its_position(self) -> None:
+    async def test_an_expansion_cancellation_does_not_wait_for_its_position(
+        self,
+    ) -> None:
         hang = asyncio.Event()
 
         async def expand(x: int) -> AsyncIterator[int]:
             if x == 0:
-                # Parks forever, so the `yield` below is never reached -- but it
-                # keeps this an async generator rather than a coroutine.
+                # Parks forever, so the `yield` below is never reached, but it keeps
+                # this an async generator rather than a coroutine.
                 await hang.wait()
                 yield 0
             raise asyncio.CancelledError
 
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(pipe([0, 1]).flat_map(expand, concurrency=2, ordered=True).collect(), timeout=1)
+            await asyncio.wait_for(
+                pipe([0, 1]).flat_map(expand, concurrency=2, ordered=True).collect(),
+                timeout=1,
+            )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("stage", ["map", "flat_map"])
-    async def test_a_source_cancellation_does_not_wait_for_started_work(self, stage: str) -> None:
+    async def test_a_source_cancellation_does_not_wait_for_started_work(
+        self, stage: str
+    ) -> None:
         hang = asyncio.Event()
 
         async def source() -> AsyncIterator[int]:
@@ -835,7 +933,9 @@ class TestOrderedCancellation:
 
         builders = {
             "map": lambda: pipe(source()).map(slow_map, concurrency=2, ordered=True),
-            "flat_map": lambda: pipe(source()).flat_map(slow_expand, concurrency=2, ordered=True),
+            "flat_map": lambda: pipe(source()).flat_map(
+                slow_expand, concurrency=2, ordered=True
+            ),
         }
 
         with pytest.raises(asyncio.CancelledError):
@@ -845,14 +945,26 @@ class TestOrderedCancellation:
 class TestInThread:
     @pytest.mark.asyncio
     async def test_in_thread_supports_blocking_map(self) -> None:
-        result = await pipe([1, 2, 3]).map(in_thread(lambda x: x * 2), concurrency=3).collect()
+        result = (
+            await pipe([1, 2, 3])
+            .map(in_thread(lambda x: x * 2), concurrency=3)
+            .collect()
+        )
 
         assert sorted(result) == [2, 4, 6]
 
     @pytest.mark.asyncio
     async def test_in_thread_supports_filter_and_flat_map(self) -> None:
-        filtered = await pipe([1, 2, 3, 4]).filter(in_thread(lambda x: x % 2 == 0), concurrency=1).collect()
-        expanded = await pipe([1, 2]).flat_map(in_thread(lambda x: [x, x * 10]), concurrency=1).collect()
+        filtered = (
+            await pipe([1, 2, 3, 4])
+            .filter(in_thread(lambda x: x % 2 == 0), concurrency=1)
+            .collect()
+        )
+        expanded = (
+            await pipe([1, 2])
+            .flat_map(in_thread(lambda x: [x, x * 10]), concurrency=1)
+            .collect()
+        )
 
         assert filtered == [2, 4]
         assert expanded == [1, 10, 2, 20]
@@ -868,8 +980,14 @@ class TestInThread:
             time.sleep(0.01)
             return x
 
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="flowlet-test") as pool:
-            result = await pipe([1, 2, 3]).map(in_thread(record_thread, executor=pool), concurrency=3).collect()
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="flowlet-test"
+        ) as pool:
+            result = (
+                await pipe([1, 2, 3])
+                .map(in_thread(record_thread, executor=pool), concurrency=3)
+                .collect()
+            )
 
         assert sorted(result) == [1, 2, 3]
         assert thread_names
@@ -880,7 +998,11 @@ class TestInThread:
         request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id")
         request_id.set("req-1")
 
-        result = await pipe([1, 2]).map(in_thread(lambda _: request_id.get()), concurrency=2).collect()
+        result = (
+            await pipe([1, 2])
+            .map(in_thread(lambda _: request_id.get()), concurrency=2)
+            .collect()
+        )
 
         assert result == ["req-1", "req-1"]
 
@@ -901,7 +1023,11 @@ class TestInProcess:
     async def test_in_process_supports_blocking_map(self) -> None:
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
-            result = await pipe([1, 2, 3]).map(in_process(process_double, executor=pool), concurrency=3).collect()
+            result = (
+                await pipe([1, 2, 3])
+                .map(in_process(process_double, executor=pool), concurrency=3)
+                .collect()
+            )
 
         assert sorted(result) == [2, 4, 6]
 
@@ -910,9 +1036,15 @@ class TestInProcess:
         ctx = mp.get_context("fork")
         with ProcessPoolExecutor(max_workers=2, mp_context=ctx) as pool:
             filtered = (
-                await pipe([1, 2, 3, 4]).filter(in_process(process_is_even, executor=pool), concurrency=2).collect()
+                await pipe([1, 2, 3, 4])
+                .filter(in_process(process_is_even, executor=pool), concurrency=2)
+                .collect()
             )
-            expanded = await pipe([1, 2]).flat_map(in_process(process_expand, executor=pool), concurrency=2).collect()
+            expanded = (
+                await pipe([1, 2])
+                .flat_map(in_process(process_expand, executor=pool), concurrency=2)
+                .collect()
+            )
 
         assert sorted(filtered) == [2, 4]
         assert sorted(expanded) == [1, 2, 10, 20]
@@ -1020,7 +1152,9 @@ class TestSourcesAndTerminals:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("concurrency", [1, 2, 4])
-    async def test_source_cleanup_failure_is_reported_by_close(self, concurrency: int) -> None:
+    async def test_source_cleanup_failure_is_reported_by_close(
+        self, concurrency: int
+    ) -> None:
         async def source() -> AsyncIterator[int]:
             try:
                 yield 1
@@ -1028,9 +1162,9 @@ class TestSourcesAndTerminals:
             finally:
                 raise ValueError("cleanup boom")
 
-        # With concurrency > 1 the feeder is parked in anext() when cancelled. The
-        # driver has stopped reading the queue by then, so the feeder must re-raise
-        # the failure from its task for teardown to surface it.
+        # With concurrency > 1 the feeder is parked in anext() when cancelled.
+        # The driver has stopped reading the queue by then, so the feeder must
+        # re-raise the failure from its task for teardown to see it.
         stream = pipe(source()).map(double, concurrency=concurrency).__aiter__()
         await anext(stream)
         await settle()
@@ -1042,11 +1176,17 @@ class TestSourcesAndTerminals:
     @pytest.mark.parametrize(
         "build",
         [
-            pytest.param(lambda work: pipe(range(3)).map(work, concurrency=2), id="map"),
-            pytest.param(lambda work: pipe(range(3)).flat_map(work, concurrency=2), id="flat_map"),
+            pytest.param(
+                lambda work: pipe(range(3)).map(work, concurrency=2), id="map"
+            ),
+            pytest.param(
+                lambda work: pipe(range(3)).flat_map(work, concurrency=2), id="flat_map"
+            ),
         ],
     )
-    async def test_task_cleanup_failure_during_teardown_is_reported(self, build: Any) -> None:
+    async def test_task_cleanup_failure_during_teardown_is_reported(
+        self, build: Any
+    ) -> None:
         async def work(x: int) -> list[int]:
             if x > 0:
                 try:
@@ -1059,8 +1199,8 @@ class TestSourcesAndTerminals:
         await anext(stream)
         await settle()
 
-        # The driver has stopped reading the queue during teardown, so a worker or
-        # expansion must re-raise its failure, not just publish it.
+        # During teardown the driver has stopped reading the queue, so a worker
+        # or expansion must re-raise its failure, not just publish it.
         with pytest.raises(ValueError, match="cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 
@@ -1068,11 +1208,18 @@ class TestSourcesAndTerminals:
     @pytest.mark.parametrize(
         "build",
         [
-            pytest.param(lambda source, work: pipe(source).map(work, concurrency=4), id="map"),
-            pytest.param(lambda source, work: pipe(source).flat_map(work, concurrency=4), id="flat_map"),
+            pytest.param(
+                lambda source, work: pipe(source).map(work, concurrency=4), id="map"
+            ),
+            pytest.param(
+                lambda source, work: pipe(source).flat_map(work, concurrency=4),
+                id="flat_map",
+            ),
         ],
     )
-    async def test_source_cleanup_failure_outranks_worker_cleanup_failures(self, build: Any) -> None:
+    async def test_source_cleanup_failure_outranks_worker_cleanup_failures(
+        self, build: Any
+    ) -> None:
         async def source() -> AsyncIterator[int]:
             yield 0
             yield 1
@@ -1095,7 +1242,7 @@ class TestSourcesAndTerminals:
         await settle()
 
         # Teardown cancels the feeder first, so when the source and the workers
-        # all fail to clean up, the source's failure is the one reported, every time.
+        # all fail to clean up, the source's failure wins every time.
         with pytest.raises(ValueError, match="source cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 
@@ -1104,13 +1251,18 @@ class TestSourcesAndTerminals:
         "build",
         [
             # Only the concurrent drivers read ahead, so only they can exhaust the
-            # source before the consumer abandons. The sequential paths are lazy and
-            # are covered by test_source_cleanup_failure_is_reported_by_close.
+            # source before the consumer leaves. The sequential paths are lazy, and
+            # test_source_cleanup_failure_is_reported_by_close covers them.
             pytest.param(lambda s: pipe(s).map(double, concurrency=2), id="map_c2"),
-            pytest.param(lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2), id="flat_map_c2"),
+            pytest.param(
+                lambda s: pipe(s).flat_map(lambda x: [x], concurrency=2),
+                id="flat_map_c2",
+            ),
         ],
     )
-    async def test_cleanup_failure_on_natural_exhaustion_is_reported(self, build: Any) -> None:
+    async def test_cleanup_failure_on_natural_exhaustion_is_reported(
+        self, build: Any
+    ) -> None:
         cleanup_ran = asyncio.Event()
 
         class ExhaustOnSecondRead:
@@ -1131,15 +1283,15 @@ class TestSourcesAndTerminals:
                 raise ValueError("cleanup boom")
 
         stream = build(ExhaustOnSecondRead()).__aiter__()
-        # The value still arrives: the feeder retains its source's close failure for
-        # teardown rather than ending the input with it.
+        # The value still arrives: the feeder keeps its source's close failure
+        # for teardown instead of ending the input with it.
         await anext(stream)
         # The consumer holds a value, so the driver is parked at its yield.
-        # Waiting on the event pins the state without depending on sleep timing.
+        # Waiting on the event pins that state without relying on sleep timing.
         await asyncio.wait_for(cleanup_ran.wait(), timeout=1)
 
-        # No cancellation was pending when cleanup failed, so the failure has to
-        # be retained rather than left in a queue nobody reads.
+        # No cancellation was pending when cleanup failed, so the failure must
+        # be kept, not left in a queue nobody reads.
         with pytest.raises(ValueError, match="cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 
@@ -1194,7 +1346,9 @@ class TestErrors:
             await pipe([1]).flat_map(stop).collect()
 
     @pytest.mark.asyncio
-    async def test_flat_map_base_exception_during_async_iteration_propagates(self) -> None:
+    async def test_flat_map_base_exception_during_async_iteration_propagates(
+        self,
+    ) -> None:
         class StopNow(BaseException):
             pass
 
@@ -1268,7 +1422,9 @@ class TestBatch:
 
     @pytest.mark.asyncio
     async def test_batch_after_concurrent_stage(self) -> None:
-        result: list[list[int]] = await pipe(range(6)).map(double, concurrency=3).batch(2).collect()
+        result: list[list[int]] = (
+            await pipe(range(6)).map(double, concurrency=3).batch(2).collect()
+        )
 
         all_values = sorted(v for batch in result for v in batch)
         assert all_values == [0, 2, 4, 6, 8, 10]
@@ -1489,7 +1645,9 @@ class TestThreadLocal:
         assert b() == [2]
 
     @pytest.mark.asyncio
-    async def test_in_thread_reuses_one_resource_per_worker_and_scoped_cleanup(self) -> None:
+    async def test_in_thread_reuses_one_resource_per_worker_and_scoped_cleanup(
+        self,
+    ) -> None:
         created: set[int] = set()
         closed: set[int] = set()
         lock = threading.Lock()
@@ -1509,7 +1667,11 @@ class TestThreadLocal:
             return resource()
 
         with ThreadPoolExecutor(max_workers=4) as pool:
-            result = await pipe(range(40)).map(in_thread(use_resource, executor=pool), concurrency=40).collect()
+            result = (
+                await pipe(range(40))
+                .map(in_thread(use_resource, executor=pool), concurrency=40)
+                .collect()
+            )
             assert set(result) == created
             assert len(created) <= 4
             assert closed == set()
