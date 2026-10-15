@@ -226,6 +226,24 @@ class TestConcurrency:
         assert sorted(result) == [20, 30, 40]
 
     @pytest.mark.asyncio
+    async def test_map_applies_backpressure_to_a_slow_consumer(self) -> None:
+        # A slot returns only once its result is delivered, so a consumer that
+        # stops reading stops the stage from starting more work.
+        started = 0
+
+        def work(x: int) -> int:
+            nonlocal started
+            started += 1
+            return x
+
+        stream = pipe(range(100)).map(work, concurrency=4).__aiter__()
+        await anext(stream)
+        await settle()
+
+        assert started == 4
+        await cast(Any, stream).aclose()
+
+    @pytest.mark.asyncio
     async def test_flat_map_applies_backpressure_to_a_slow_consumer(self) -> None:
         produced = 0
 
@@ -915,7 +933,12 @@ async def async_gen(x: int) -> AsyncIterator[int]:
     yield x
 
 
-@pytest.mark.parametrize("wrapper", ["in_thread", "in_process"])
+def in_process_pool(fn: Any) -> Any:
+    with ProcessPoolExecutor(max_workers=1) as pool:
+        return in_process(fn, executor=pool)
+
+
+@pytest.mark.parametrize("wrap", [in_thread, in_process_pool])
 @pytest.mark.parametrize(
     "fn",
     [
@@ -924,12 +947,9 @@ async def async_gen(x: int) -> AsyncIterator[int]:
         pytest.param(async_gen, id="async_generator"),
     ],
 )
-def test_executor_wrappers_reject_async_callables(wrapper: str, fn: Any) -> None:
-    with ProcessPoolExecutor(max_workers=1) as pool, pytest.raises(TypeError, match="async callables"):
-        if wrapper == "in_thread":
-            in_thread(fn)
-        else:
-            in_process(fn, executor=pool)
+def test_executor_wrappers_reject_async_callables(wrap: Any, fn: Any) -> None:
+    with pytest.raises(TypeError, match="async callables"):
+        wrap(fn)
 
 
 class TestSourcesAndTerminals:
@@ -1008,12 +1028,39 @@ class TestSourcesAndTerminals:
             finally:
                 raise ValueError("cleanup boom")
 
-        # Parked in anext() when cancelled: the driver has stopped reading the
-        # queue by then, so the failure must be retained for teardown.
+        # With concurrency > 1 the feeder is parked in anext() when cancelled. The
+        # driver has stopped reading the queue by then, so the feeder must re-raise
+        # the failure from its task for teardown to surface it.
         stream = pipe(source()).map(double, concurrency=concurrency).__aiter__()
         await anext(stream)
-        await asyncio.sleep(0.02)
+        await settle()
 
+        with pytest.raises(ValueError, match="cleanup boom"):
+            await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "build",
+        [
+            pytest.param(lambda work: pipe(range(3)).map(work, concurrency=2), id="map"),
+            pytest.param(lambda work: pipe(range(3)).flat_map(work, concurrency=2), id="flat_map"),
+        ],
+    )
+    async def test_task_cleanup_failure_during_teardown_is_reported(self, build: Any) -> None:
+        async def work(x: int) -> list[int]:
+            if x > 0:
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    raise ValueError("cleanup boom")
+            return [x]
+
+        stream = build(work).__aiter__()
+        await anext(stream)
+        await settle()
+
+        # The driver has stopped reading the queue during teardown, so a worker or
+        # expansion must re-raise its failure, not just publish it.
         with pytest.raises(ValueError, match="cleanup boom"):
             await asyncio.wait_for(cast(Any, stream).aclose(), timeout=1)
 
