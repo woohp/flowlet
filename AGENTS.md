@@ -43,7 +43,7 @@ flowlet is a small, dependency-free async pipeline library: one package, Python 
 - Prove cleanup without `sleep` or `gc.collect()`; a probe using either passes against broken code. Prefer plain-class iterators over generators when asserting closes, since the cyclic collector can close a generator on its own.
 - Synchronize with events or bounded `asyncio.sleep(0)` turns (`settle()`) instead of wall-clock sleeps and timing-dependent counts.
 - When changing pipeline behavior, run the focused async tests first, then the full suite. `pytest` runs with `-s`, so print output is not captured.
-- Measure performance changes interleaved in one process; drift between sessions on one machine is often larger than the effect being measured.
+- Measure performance changes interleaved in one process; drift between sessions on one machine is often larger than the effect being measured. `benchmark/` has the harnesses (see its `README.md`).
 
 ## Commands
 
