@@ -89,7 +89,7 @@ class SyncIterator:
     def __init__(self, state: Tracked, items: int, terminal: str, close: str) -> None:
         self.state, self.items, self.terminal, self.close_mode = state, items, terminal, close
 
-    def __iter__(self) -> "SyncIterator":
+    def __iter__(self) -> SyncIterator:
         return self
 
     def __next__(self) -> int:
@@ -105,7 +105,7 @@ class AsyncIterator:
     def __init__(self, state: Tracked, items: int, terminal: str, close: str) -> None:
         self.state, self.items, self.terminal, self.close_mode = state, items, terminal, close
 
-    def __aiter__(self) -> "AsyncIterator":
+    def __aiter__(self) -> AsyncIterator:
         return self
 
     async def __anext__(self) -> int:

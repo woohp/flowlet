@@ -1,6 +1,6 @@
 # flowlet agent guide
 
-flowlet is a small, dependency-free async pipeline library: one package, Python 3.13 (pinned in `pyproject.toml` and `.python-version`). Most of its complexity is deliberate and concentrated in iterator ownership, concurrency, and failure delivery; read the relevant docstrings in `functional.py` before simplifying any of it.
+flowlet is a small, dependency-free async pipeline library: one package, Python 3.14 (pinned in `pyproject.toml` and `.python-version`). Most of its complexity is deliberate and concentrated in iterator ownership, concurrency, and failure delivery; read the relevant docstrings in `functional.py` before simplifying any of it.
 
 ## Navigation
 

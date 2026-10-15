@@ -6,7 +6,7 @@ Give it some data, add a few steps, and consume the results. Slow steps can run 
 
 ## Requirements
 
-`flowlet` requires Python 3.13 or newer.
+`flowlet` requires Python 3.14 or newer.
 
 ## Installation
 

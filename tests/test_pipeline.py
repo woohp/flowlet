@@ -1082,7 +1082,7 @@ class TestSourcesAndTerminals:
             def __init__(self) -> None:
                 self.emitted = 0
 
-            def __aiter__(self) -> "ExhaustOnSecondRead":
+            def __aiter__(self) -> ExhaustOnSecondRead:
                 return self
 
             async def __anext__(self) -> int:
