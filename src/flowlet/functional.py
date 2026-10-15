@@ -537,10 +537,7 @@ async def _map[T, U](
     ordering = _Ordered[_Value[U] | _Error]() if ordered else _Unordered[_Value[U] | _Error]()
     source_failure: BaseException | None = None
 
-    # The feeder joins its workers' set without a done callback, so teardown
-    # always awaits it.
-    workers.add(asyncio.create_task(feed()))
-    async with _Stage(workers, failures):
+    async with _Stage(asyncio.create_task(feed()), workers, failures):
         while started_total is None or yielded < started_total:
             match await results.get():
                 case _Error(error) if _bypasses_ordering(error):
@@ -639,8 +636,7 @@ async def _flat_map[T, U](
     ordering = _Ordered[_Value[U] | _Error | _Done]() if ordered else _Unordered[_Value[U] | _Error | _Done]()
     source_failure: BaseException | None = None
 
-    expansions.add(asyncio.create_task(feed()))
-    async with _Stage(expansions, source_failures, expansion_failures):
+    async with _Stage(asyncio.create_task(feed()), expansions, source_failures, expansion_failures):
         while started_total is None or finished < started_total:
             deliverable: Iterable[_Value[U] | _Error | _Done] = ()
             match await queue.get():
@@ -806,8 +802,9 @@ class _Stage:
     cancelled and awaited first.
     """
 
-    def __init__(self, tasks: set[asyncio.Task[Any]], *records: _Failures[Any]) -> None:
-        # A live set: done callbacks add to and remove from it while the stage runs.
+    def __init__(self, feeder: asyncio.Task[Any], tasks: set[asyncio.Task[Any]], *records: _Failures[Any]) -> None:
+        self._feeder = feeder
+        # A live set: the feeder adds to it and done callbacks remove from it.
         self._tasks = tasks
         self._records = records
 
@@ -817,7 +814,8 @@ class _Stage:
     async def __aexit__(self, exc_type: Any, error: BaseException | None, traceback: Any) -> bool:
         failure: BaseException | None = None
         try:
-            await _cancel_tasks(self._tasks)
+            # The feeder first, so its teardown failure deterministically wins.
+            await _cancel_tasks([self._feeder, *self._tasks])
         except BaseException as exc:
             failure = exc
 
