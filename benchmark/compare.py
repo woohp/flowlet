@@ -1,10 +1,11 @@
-"""flowlet against native executors/asyncio and parlane.
+"""flowlet against native executors and asyncio.
 
-    uv run --with parlane python benchmark/compare.py [--rounds N]
+    uv run python benchmark/compare.py [--rounds N]
 
-The first two scenarios are parlane's own benchmarks; the no-op ones isolate
-per-item overhead. Each row is relative to the first (native) row, and worker
-counts follow parlane's defaults so every implementation gets the same pool.
+The sleep and math scenarios model I/O- and CPU-bound work; the no-op ones
+isolate per-item overhead. Each row is relative to the first (native) row, and
+every implementation gets the same pool size. Extra comparison rows appear when
+their library is installed.
 """
 
 import argparse
@@ -17,9 +18,14 @@ import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import Executor, ProcessPoolExecutor, ThreadPoolExecutor
 
-from parlane import apmap, pmap
-
 from flowlet import in_process, in_thread, pipe
+
+try:
+    from parlane import apmap, pmap
+
+    HAVE_PARLANE = True
+except ImportError:
+    HAVE_PARLANE = False
 
 CPU = os.cpu_count() or 4
 THREADS = min(32, CPU + 4)
@@ -60,6 +66,11 @@ async def async_io_task(x: int) -> int:
 
 async def async_noop(x: int) -> int:
     return x
+
+
+def optional(available: bool, label: str, run: Callable[[], object]) -> dict[str, Callable[[], object]]:
+    """A comparison row that appears only when its library is installed."""
+    return {label: run} if available else {}
 
 
 def threads() -> ThreadPoolExecutor:
@@ -106,17 +117,17 @@ async def flowlet_processes[T](fn: Callable[[int], T], items: list[int]) -> list
 SCENARIOS: dict[str, dict[str, Callable[[], object]]] = {
     "I/O threads: 100 x 50ms sleep": {
         "concurrent.futures": lambda: executor_map(threads, io_task, IO_ITEMS),
-        "parlane pmap": lambda: pmap(io_task, IO_ITEMS, backend="thread"),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(io_task, IO_ITEMS, backend="thread")),
         "flowlet in_thread": lambda: flowlet_threads(io_task, IO_ITEMS),
     },
     "CPU processes: 200 x heavy math": {
         "concurrent.futures": lambda: executor_map(processes, cpu_task, CPU_ITEMS),
-        "parlane pmap": lambda: pmap(cpu_task, CPU_ITEMS, backend="process"),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(cpu_task, CPU_ITEMS, backend="process")),
         "flowlet in_process": lambda: flowlet_processes(cpu_task, CPU_ITEMS),
     },
     "async I/O: 100 x 50ms sleep": {
         "asyncio gather": lambda: asyncio_gather(async_io_task, IO_ITEMS, ASYNC),
-        "parlane apmap": lambda: apmap(async_io_task, IO_ITEMS, workers=ASYNC),
+        **optional(HAVE_PARLANE, "parlane apmap", lambda: apmap(async_io_task, IO_ITEMS, workers=ASYNC)),
         "flowlet map": lambda: pipe(IO_ITEMS).map(async_io_task, concurrency=ASYNC, ordered=True).collect(),
     },
     "threads: 20k no-op": {
@@ -124,12 +135,12 @@ SCENARIOS: dict[str, dict[str, Callable[[], object]]] = {
         # The fair native baseline for an asyncio library: each item crosses
         # between the event loop and a worker thread, which dominates here.
         "asyncio run_in_executor": lambda: asyncio_executor(threads, noop, TINY_ITEMS, THREADS),
-        "parlane pmap": lambda: pmap(noop, TINY_ITEMS, backend="thread"),
+        **optional(HAVE_PARLANE, "parlane pmap", lambda: pmap(noop, TINY_ITEMS, backend="thread")),
         "flowlet in_thread": lambda: flowlet_threads(noop, TINY_ITEMS),
     },
     "async: 20k no-op": {
         "asyncio gather": lambda: asyncio_gather(async_noop, TINY_ITEMS, ASYNC),
-        "parlane apmap": lambda: apmap(async_noop, TINY_ITEMS, workers=ASYNC),
+        **optional(HAVE_PARLANE, "parlane apmap", lambda: apmap(async_noop, TINY_ITEMS, workers=ASYNC)),
         "flowlet map": lambda: pipe(TINY_ITEMS).map(async_noop, concurrency=ASYNC, ordered=True).collect(),
         "flowlet map unordered": lambda: pipe(TINY_ITEMS).map(async_noop, concurrency=ASYNC).collect(),
     },
