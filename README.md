@@ -280,7 +280,7 @@ def load_s3(key):
 items = await pipe(keys).map(in_thread(load_s3), concurrency=64).collect()
 ```
 
-Plain factories are also supported when no cleanup is needed. For generator factories, the first yielded value is cached per calling thread; the generator is never resumed and is closed during teardown. `s3.close()` explicitly closes only the current thread's resource and clears that thread's cache.
+Plain factories are also supported when no cleanup is needed. For generator factories, the first yielded value is cached per calling thread; the generator is never resumed, and is closed by `.close()` or when its thread exits. A cleanup error at thread exit cannot propagate to any caller, so Python reports it through `sys.unraisablehook`. `s3.close()` explicitly closes only the current thread's resource and clears that thread's cache.
 
 To clean up worker resources at a defined point, use an explicit `ThreadPoolExecutor` context manager. When the context exits, the pool shuts down, its worker threads exit, and the per-thread generators created on those workers are closed:
 

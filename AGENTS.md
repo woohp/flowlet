@@ -4,7 +4,7 @@ flowlet is a small, dependency-free async pipeline library: one package, Python 
 
 ## Navigation
 
-- `src/flowlet/functional.py` is the execution core: curried operators, the stage drivers, and ownership. `_flow.py` (`pipe`, `Pipeline`, `Flow`) and `op.py` wrap its operators and must not duplicate execution logic. `_threading.py` (`in_thread`, `thread_local`) and `_processing.py` (`in_process`) are executor adapters.
+- `src/flowlet/functional.py` is the execution core: curried operators, the stage drivers, and ownership. `_flow.py` (`pipe`, `Pipeline`, `Flow`) and `op.py` wrap its operators and must not duplicate execution logic. `_threading.py` (`in_thread`, `thread_local`) and `_processing.py` (`in_process`) move blocking work off the event loop and manage per-thread resources.
 - The `map`/`flat_map`/`filter`/`batch` signatures repeat across `Pipeline`, `Flow`, `op`, and `functional` because each returns a differently typed object; the typing makes this duplication unavoidable, so do not abstract it away.
 - `tests/test_pipeline.py` covers behavior and API. `tests/test_lifecycle.py` is the specification for iterator ownership (see Testing).
 - Keep `README.md` in sync when public behavior, parameters, or examples change.
@@ -25,8 +25,8 @@ flowlet is a small, dependency-free async pipeline library: one package, Python 
 
 ## Ordering
 
-- Concurrent stages emit in completion order by default. `ordered=True` is opt-in and must produce what `concurrency=1` would, including holding an ordinary failure until its input position. Cancellation alone bypasses ordering (`_bypasses_ordering`): it is teardown, not an item's outcome. Every other `BaseException` is positional.
-- Each message carries its input position. The delivery policy (`_Ordered` / `_Unordered`) is chosen at construction, so each driver has a single delivery path. Delivery itself (yields, semaphore releases, raising positional failures) stays in the drivers: an ordering layer wrapped around a stage's output sits outside the slot/capacity loop (unbounded buffering) and outside `aclose` propagation. Unordered `flat_map`'s `_Value` arm is a deliberate fast path.
+- Concurrent stages emit in completion order by default. `ordered=True` is opt-in and must produce what `concurrency=1` would, including holding an ordinary failure until its input position. Cancellation alone bypasses ordering (`_bypasses_ordering`): it is teardown, not an item's outcome. Every other `BaseException` is positional. Bypassing starts teardown at once but does not make it instant: `_Stage` still awaits supervised tasks, so a task that swallows its cancellation or an `aclose()` that hangs delays teardown in either mode.
+- Each message carries its input position. The delivery policy (`_Ordered` / `_Unordered`) is chosen at construction, so each driver has a single delivery path; only the `_Fed` hold-or-raise and the capacity lookup stay mode-aware, because they genuinely differ per mode. Delivery itself (yields, semaphore releases, raising positional failures) stays in the drivers: an ordering layer wrapped around a stage's output sits outside the slot/capacity loop (unbounded buffering) and outside `aclose` propagation. Unordered `flat_map`'s `_Value` arm is a deliberate fast path.
 - Ordered `flat_map` needs both a per-expansion value allowance (one shared allowance deadlocks: an out-of-turn expansion fills it and the in-turn one cannot publish) and a slot returned on *delivery*, not termination (otherwise the feeder starts expansions past the bound). Its memory bound is `concurrency * (buffer + 1)` against `buffer + concurrency` unordered.
 - A source failure has no position of its own; an ordered driver holds it until every started item is delivered. An expansion's cleanup failure is positional, which is why expansion owners carry `seq`.
 
